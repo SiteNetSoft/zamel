@@ -1,0 +1,19 @@
+.{
+    .name = .zamel,
+    .version = "0.0.1",
+
+    // Copy the suggested value from the error here:
+    .fingerprint = 0xea5b75f7c5f1fdf8,
+
+    // Minimum Zig version your project supports (can tweak later)
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{},
+
+    // Files that define the package
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

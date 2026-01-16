@@ -1,0 +1,31 @@
+const std = @import("std");
+const Exchange = @import("exchange.zig").Exchange;
+
+pub const Producer = struct {
+    ctx: ?*anyopaque,
+    sendFn: *const fn (ctx: ?*anyopaque, ex: *Exchange) anyerror!void,
+
+    pub fn send(self: Producer, ex: *Exchange) !void {
+        try self.sendFn(self.ctx, ex);
+    }
+};
+
+pub const Endpoint = struct {
+    // Optional: some endpoints are also Consumers (timer/file/kafka).
+    ctx: ?*anyopaque,
+
+    createProducerFn: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!Producer,
+
+    pub fn createProducer(self: Endpoint, allocator: std.mem.Allocator) !Producer {
+        return try self.createProducerFn(self.ctx, allocator);
+    }
+};
+
+/// "EndpointRef" is what Steps reference. Later you can add variants:
+/// - typed endpoint
+/// - parsed-from-URI endpoint
+/// - lazy-resolved by registry
+pub const EndpointRef = union(enum) {
+    endpoint: Endpoint,
+    // uri: []const u8, // optional: if you want to delay parsing/resolution
+};
