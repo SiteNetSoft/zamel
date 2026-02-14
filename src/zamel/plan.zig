@@ -30,3 +30,34 @@ pub const RoutePlan = struct {
         return &self.routes.items[id];
     }
 };
+
+// -------- tests --------
+
+const Processor = @import("processor.zig").Processor;
+
+fn noopProcessor(_: ?*anyopaque, _: *@import("exchange.zig").Exchange) !void {}
+
+test "addRoute returns sequential ids" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps1 = [_]Step{.{ .Process = Processor.fromFn(noopProcessor, null) }};
+    const id0 = try plan.addRoute(alloc, &steps1);
+    try std.testing.expectEqual(@as(u32, 0), id0);
+
+    var steps2 = [_]Step{.{ .Process = Processor.fromFn(noopProcessor, null) }};
+    const id1 = try plan.addRoute(alloc, &steps2);
+    try std.testing.expectEqual(@as(u32, 1), id1);
+}
+
+test "route retrieval by id" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(noopProcessor, null) }};
+    const id = try plan.addRoute(alloc, &steps);
+    const r = plan.route(id);
+    try std.testing.expectEqual(@as(usize, 1), r.steps.len);
+}

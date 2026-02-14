@@ -3,11 +3,11 @@ const Predicate = @import("predicate.zig").Predicate;
 const Exchange = @import("exchange.zig").Exchange;
 
 /// Predicate: header(key) == value
-pub fn headerEq(key: []const u8, value: []const u8) Predicate {
+pub fn headerEq(allocator: std.mem.Allocator, key: []const u8, value: []const u8) Predicate {
     const Ctx = struct { key: []const u8, value: []const u8 };
 
     const ctx_ptr = blk: {
-        const p = std.heap.page_allocator.create(Ctx) catch unreachable;
+        const p = allocator.create(Ctx) catch unreachable;
         p.* = .{ .key = key, .value = value };
         break :blk p;
     };
@@ -24,11 +24,11 @@ fn headerEqCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
 }
 
 /// Predicate: body contains substring needle
-pub fn bodyContains(needle: []const u8) Predicate {
+pub fn bodyContains(allocator: std.mem.Allocator, needle: []const u8) Predicate {
     const Ctx = struct { needle: []const u8 };
 
     const ctx_ptr = blk: {
-        const p = std.heap.page_allocator.create(Ctx) catch unreachable;
+        const p = allocator.create(Ctx) catch unreachable;
         p.* = .{ .needle = needle };
         break :blk p;
     };
@@ -41,4 +41,70 @@ fn bodyContainsCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
     const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
 
     return std.mem.indexOf(u8, ex.body, c.needle) != null;
+}
+
+// -------- tests --------
+
+test "headerEq matches when header present and equal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("type", "A");
+
+    const pred = headerEq(alloc, "type", "A");
+    try std.testing.expect(try pred.call(&ex));
+}
+
+test "headerEq returns false on mismatch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("type", "B");
+
+    const pred = headerEq(alloc, "type", "A");
+    try std.testing.expect(!(try pred.call(&ex)));
+}
+
+test "headerEq returns false when header missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+
+    const pred = headerEq(alloc, "type", "A");
+    try std.testing.expect(!(try pred.call(&ex)));
+}
+
+test "bodyContains matches when substring present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.setBody("hello world");
+
+    const pred = bodyContains(alloc, "world");
+    try std.testing.expect(try pred.call(&ex));
+}
+
+test "bodyContains returns false when substring absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    const pred = bodyContains(alloc, "world");
+    try std.testing.expect(!(try pred.call(&ex)));
 }

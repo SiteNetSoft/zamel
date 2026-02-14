@@ -34,3 +34,40 @@ pub const Exchange = struct {
         return self.headers.get(key);
     }
 };
+
+// -------- tests --------
+
+test "setBody stores and replaces body" {
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+
+    try ex.setBody("hello");
+    try std.testing.expectEqualStrings("hello", ex.body);
+
+    try ex.setBody("world");
+    try std.testing.expectEqualStrings("world", ex.body);
+}
+
+test "getHeader returns null for missing key" {
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+
+    try std.testing.expect(ex.getHeader("missing") == null);
+}
+
+test "putHeader stores and retrieves value" {
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+
+    try ex.putHeader("key", "value");
+    try std.testing.expectEqualStrings("value", ex.getHeader("key").?);
+}
+
+test "putHeader replaces existing value" {
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+
+    try ex.putHeader("key", "old");
+    try ex.putHeader("key", "new");
+    try std.testing.expectEqualStrings("new", ex.getHeader("key").?);
+}

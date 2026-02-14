@@ -1,8 +1,10 @@
 const std = @import("std");
+const posix = std.posix;
 const Exchange = @import("exchange.zig").Exchange;
 const Services = @import("services.zig").Services;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const Step = @import("step.zig").Step;
+const PolicyKind = @import("step.zig").PolicyKind;
 const RouteId = @import("step.zig").RouteId;
 
 pub const SyncExecutor = struct {
@@ -47,9 +49,40 @@ pub const SyncExecutor = struct {
                     return error.NotImplemented;
                 },
 
-                .Policy => {
-                    return error.NotImplemented;
+                .Policy => |pol| {
+                    switch (pol.kind) {
+                        .Retry => |retry| {
+                            var last_err: ?anyerror = null;
+                            for (0..retry.max) |_| {
+                                if (self.run(plan, pol.route, ex)) {
+                                    last_err = null;
+                                    break;
+                                } else |err| {
+                                    last_err = err;
+                                    if (retry.backoff_ms > 0) {
+                                        sleepMs(@as(u64, retry.backoff_ms));
+                                    }
+                                }
+                            }
+                            if (last_err) |err| return err;
+                        },
+                        .Timeout => return error.NotImplemented,
+                        .DeadLetter => return error.NotImplemented,
+                        .CircuitBreaker => return error.NotImplemented,
+                    }
                 },
+            }
+        }
+    }
+
+    fn sleepMs(ms: u64) void {
+        const ns = ms * std.time.ns_per_ms;
+        var req = posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+        while (true) {
+            switch (posix.errno(posix.system.nanosleep(&req, &req))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => unreachable,
             }
         }
     }
@@ -64,3 +97,163 @@ pub const SyncExecutor = struct {
         }
     }
 };
+
+// -------- tests --------
+
+const Predicate = @import("predicate.zig").Predicate;
+const Processor = @import("processor.zig").Processor;
+const ChoiceBranch = @import("step.zig").ChoiceBranch;
+const Clock = @import("services.zig").Clock;
+
+fn testClock(_: ?*anyopaque) u64 {
+    return 0;
+}
+
+fn testServices() Services {
+    return .{
+        .allocator = std.testing.allocator,
+        .clock = .{ .nowMillisFn = testClock, .ctx = null },
+    };
+}
+
+fn appendProcessor(ctx: ?*anyopaque, ex: *Exchange) !void {
+    _ = ctx;
+    const old = ex.body;
+    const new = try ex.allocator.alloc(u8, old.len + 1);
+    @memcpy(new[0..old.len], old);
+    new[old.len] = 'X';
+    if (old.len != 0) ex.allocator.free(old);
+    ex.body = new;
+}
+
+test "Process step executes processor" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hi");
+
+    var exec = SyncExecutor.init(testServices());
+    try exec.run(&plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("hiX", ex.body);
+}
+
+fn alwaysFalse(_: ?*anyopaque, _: *Exchange) !bool {
+    return false;
+}
+
+fn alwaysTrue(_: ?*anyopaque, _: *Exchange) !bool {
+    return true;
+}
+
+test "Filter stops route when predicate returns false" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{
+        .{ .Filter = Predicate.fromFn(alwaysFalse, null) },
+        .{ .Process = Processor.fromFn(appendProcessor, null) },
+    };
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hi");
+
+    var exec = SyncExecutor.init(testServices());
+    try exec.run(&plan, rid, &ex);
+
+    // Processor should NOT have run
+    try std.testing.expectEqualStrings("hi", ex.body);
+}
+
+test "Choice branches correctly" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Sub-route for the "true" branch: appends X
+    var true_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const true_rid = try plan.addRoute(alloc, &true_steps);
+
+    // Main route with a choice
+    var branches = [_]ChoiceBranch{
+        .{ .when = Predicate.fromFn(alwaysTrue, null), .route = true_rid },
+    };
+    var main_steps = [_]Step{.{ .Choice = .{ .branches = &branches, .otherwise = null } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hi");
+
+    var exec = SyncExecutor.init(testServices());
+    try exec.run(&plan, main_rid, &ex);
+
+    try std.testing.expectEqualStrings("hiX", ex.body);
+}
+
+var fail_count: u32 = 0;
+
+fn failingProcessor(_: ?*anyopaque, _: *Exchange) !void {
+    if (fail_count > 0) {
+        fail_count -= 1;
+        return error.TransientFailure;
+    }
+}
+
+test "Retry succeeds after transient failures" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Sub-route that fails twice then succeeds
+    fail_count = 2;
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(failingProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .Retry = .{ .max = 5, .backoff_ms = 0 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(testServices());
+    try exec.run(&plan, main_rid, &ex);
+
+    // Should have succeeded (fail_count should be 0)
+    try std.testing.expectEqual(@as(u32, 0), fail_count);
+}
+
+test "Retry returns error when all attempts fail" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    fail_count = 100; // Will never reach 0 in 3 attempts
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(failingProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .Retry = .{ .max = 3, .backoff_ms = 0 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(testServices());
+    const result = exec.run(&plan, main_rid, &ex);
+    try std.testing.expectError(error.TransientFailure, result);
+}
