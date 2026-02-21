@@ -1,13 +1,17 @@
 pub const Exchange = @import("exchange.zig").Exchange;
 pub const Predicate = @import("predicate.zig").Predicate;
 pub const Processor = @import("processor.zig").Processor;
+pub const Splitter = @import("splitter.zig").Splitter;
 
 pub const Consumer = @import("consumer.zig").Consumer;
 pub const Endpoint = @import("endpoint.zig").Endpoint;
 pub const Producer = @import("endpoint.zig").Producer;
 pub const EndpointRef = @import("endpoint.zig").EndpointRef;
+pub const EndpointFactory = @import("registry.zig").EndpointFactory;
+pub const ConsumerFactory = @import("registry.zig").ConsumerFactory;
 
 pub const Step = @import("step.zig").Step;
+pub const SplitKind = @import("step.zig").SplitKind;
 pub const RoutePlan = @import("plan.zig").RoutePlan;
 
 pub const Services = @import("services.zig").Services;

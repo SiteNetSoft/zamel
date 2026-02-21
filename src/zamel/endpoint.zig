@@ -11,13 +11,16 @@ pub const Producer = struct {
 };
 
 pub const Endpoint = struct {
-    // Optional: some endpoints are also Consumers (timer/file/kafka).
     ctx: ?*anyopaque,
-
     createProducerFn: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!Producer,
+    deinitFn: ?*const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator) void = null,
 
     pub fn createProducer(self: Endpoint, allocator: std.mem.Allocator) !Producer {
         return try self.createProducerFn(self.ctx, allocator);
+    }
+
+    pub fn deinit(self: Endpoint, allocator: std.mem.Allocator) void {
+        if (self.deinitFn) |f| f(self.ctx, allocator);
     }
 };
 

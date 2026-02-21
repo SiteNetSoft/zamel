@@ -2,11 +2,13 @@ const std = @import("std");
 const Step = @import("step.zig").Step;
 const ChoiceBranch = @import("step.zig").ChoiceBranch;
 const PolicyKind = @import("step.zig").PolicyKind;
+const SplitKind = @import("step.zig").SplitKind;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const RouteId = @import("step.zig").RouteId;
 
 const Predicate = @import("predicate.zig").Predicate;
 const Processor = @import("processor.zig").Processor;
+const Splitter = @import("splitter.zig").Splitter;
 const Endpoint = @import("endpoint.zig").Endpoint;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 
@@ -79,14 +81,28 @@ pub const RtBuilder = struct {
         return ChoiceBuilder.init(self);
     }
 
+    // ---- multicast DSL ----
+
+    pub fn multicast(self: *RtBuilder) MulticastBuilder {
+        return MulticastBuilder.init(self);
+    }
+
     // ---- split / aggregate DSL ----
 
     pub fn split(self: *RtBuilder, delimiter: u8) SplitBuilder {
-        return SplitBuilder.init(self, delimiter);
+        return SplitBuilder.init(self, .{ .scalar = delimiter });
     }
 
     pub fn splitLines(self: *RtBuilder) SplitBuilder {
-        return SplitBuilder.init(self, '\n');
+        return SplitBuilder.init(self, .{ .scalar = '\n' });
+    }
+
+    pub fn splitSequence(self: *RtBuilder, separator: []const u8) SplitBuilder {
+        return SplitBuilder.init(self, .{ .sequence = separator });
+    }
+
+    pub fn splitBy(self: *RtBuilder, splitter: Splitter) SplitBuilder {
+        return SplitBuilder.init(self, .{ .custom = splitter });
     }
 
     pub fn aggregate(self: *RtBuilder, separator: []const u8) AggregateBuilder {
@@ -144,6 +160,10 @@ pub const ChoiceBuilder = struct {
         };
     }
 
+    fn alloc(self: *ChoiceBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
     pub fn when(self: *ChoiceBuilder, pred: Predicate) WhenBuilder {
         return WhenBuilder.init(self, pred);
     }
@@ -153,9 +173,8 @@ pub const ChoiceBuilder = struct {
     }
 
     pub fn end(self: *ChoiceBuilder) !*RtBuilder {
-        const branches_slice = self.branches.items;
-        try self.parent.cur_steps.append(self.parent.arena.allocator(), .{ .Choice = .{
-            .branches = branches_slice,
+        try self.parent.cur_steps.append(self.alloc(), .{ .Choice = .{
+            .branches = self.branches.items,
             .otherwise = self.otherwise_route,
         } });
         return self.parent;
@@ -175,35 +194,34 @@ pub const WhenBuilder = struct {
         };
     }
 
+    fn alloc(self: *WhenBuilder) std.mem.Allocator {
+        return self.choice.alloc();
+    }
+
     pub fn to(self: *WhenBuilder, ep: EndpointRef) !*WhenBuilder {
-        try self.steps.append(self.choice.parent.arena.allocator(), .{ .To = ep });
+        try self.steps.append(self.alloc(), .{ .To = ep });
         return self;
     }
 
     pub fn toUri(self: *WhenBuilder, uri: []const u8) !*WhenBuilder {
-        const ep = try self.choice.parent.registry.resolve(self.choice.parent.arena.allocator(), uri);
+        const ep = try self.choice.parent.registry.resolve(self.alloc(), uri);
         return try self.to(.{ .endpoint = ep });
     }
 
     pub fn filter(self: *WhenBuilder, pred: Predicate) !*WhenBuilder {
-        try self.steps.append(self.choice.parent.arena.allocator(), .{ .Filter = pred });
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
         return self;
     }
 
     pub fn process(self: *WhenBuilder, p: Processor) !*WhenBuilder {
-        try self.steps.append(self.choice.parent.arena.allocator(), .{ .Process = p });
+        try self.steps.append(self.alloc(), .{ .Process = p });
         return self;
     }
 
     pub fn endWhen(self: *WhenBuilder) !*ChoiceBuilder {
-        const rid = try self.choice.parent.plan.addRoute(
-            self.choice.parent.arena.allocator(),
-            self.steps.items,
-        );
-        try self.choice.branches.append(
-            self.choice.parent.arena.allocator(),
-            .{ .when = self.pred, .route = rid },
-        );
+        const a = self.alloc();
+        const rid = try self.choice.parent.plan.addRoute(a, self.steps.items);
+        try self.choice.branches.append(a, .{ .when = self.pred, .route = rid });
         return self.choice;
     }
 };
@@ -219,31 +237,32 @@ pub const OtherwiseBuilder = struct {
         };
     }
 
+    fn alloc(self: *OtherwiseBuilder) std.mem.Allocator {
+        return self.choice.alloc();
+    }
+
     pub fn to(self: *OtherwiseBuilder, ep: EndpointRef) !*OtherwiseBuilder {
-        try self.steps.append(self.choice.parent.arena.allocator(), .{ .To = ep });
+        try self.steps.append(self.alloc(), .{ .To = ep });
         return self;
     }
 
     pub fn toUri(self: *OtherwiseBuilder, uri: []const u8) !*OtherwiseBuilder {
-        const ep = try self.choice.parent.registry.resolve(self.choice.parent.arena.allocator(), uri);
+        const ep = try self.choice.parent.registry.resolve(self.alloc(), uri);
         return try self.to(.{ .endpoint = ep });
     }
 
     pub fn process(self: *OtherwiseBuilder, p: Processor) !*OtherwiseBuilder {
-        try self.steps.append(self.choice.parent.arena.allocator(), .{ .Process = p });
+        try self.steps.append(self.alloc(), .{ .Process = p });
         return self;
     }
 
     pub fn filter(self: *OtherwiseBuilder, pred: Predicate) !*OtherwiseBuilder {
-        try self.steps.append(self.choice.parent.arena.allocator(), .{ .Filter = pred });
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
         return self;
     }
 
     pub fn endOtherwise(self: *OtherwiseBuilder) !*ChoiceBuilder {
-        const rid = try self.choice.parent.plan.addRoute(
-            self.choice.parent.arena.allocator(),
-            self.steps.items,
-        );
+        const rid = try self.choice.parent.plan.addRoute(self.alloc(), self.steps.items);
         self.choice.otherwise_route = rid;
         return self.choice;
     }
@@ -298,13 +317,13 @@ pub const PolicyBuilder = struct {
 
 pub const SplitBuilder = struct {
     parent: *RtBuilder,
-    delimiter: u8,
+    kind: SplitKind,
     steps: std.ArrayList(Step),
 
-    pub fn init(parent: *RtBuilder, delimiter: u8) SplitBuilder {
+    pub fn init(parent: *RtBuilder, kind: SplitKind) SplitBuilder {
         return .{
             .parent = parent,
-            .delimiter = delimiter,
+            .kind = kind,
             .steps = .empty,
         };
     }
@@ -336,7 +355,7 @@ pub const SplitBuilder = struct {
     pub fn endSplit(self: *SplitBuilder) !*RtBuilder {
         const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.parent.cur_steps.append(self.alloc(), .{ .Split = .{
-            .delimiter = self.delimiter,
+            .kind = self.kind,
             .route = rid,
         } });
         return self.parent;
@@ -387,5 +406,74 @@ pub const AggregateBuilder = struct {
             .route = rid,
         } });
         return self.parent;
+    }
+};
+
+pub const MulticastBuilder = struct {
+    parent: *RtBuilder,
+    routes: std.ArrayList(RouteId),
+
+    pub fn init(parent: *RtBuilder) MulticastBuilder {
+        return .{
+            .parent = parent,
+            .routes = .empty,
+        };
+    }
+
+    fn alloc(self: *MulticastBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn branch(self: *MulticastBuilder) MulticastBranchBuilder {
+        return MulticastBranchBuilder.init(self);
+    }
+
+    pub fn endMulticast(self: *MulticastBuilder) !*RtBuilder {
+        try self.parent.cur_steps.append(self.alloc(), .{ .Multicast = .{
+            .routes = self.routes.items,
+        } });
+        return self.parent;
+    }
+};
+
+pub const MulticastBranchBuilder = struct {
+    mc: *MulticastBuilder,
+    steps: std.ArrayList(Step),
+
+    pub fn init(mc: *MulticastBuilder) MulticastBranchBuilder {
+        return .{
+            .mc = mc,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *MulticastBranchBuilder) std.mem.Allocator {
+        return self.mc.alloc();
+    }
+
+    pub fn process(self: *MulticastBranchBuilder, p: Processor) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *MulticastBranchBuilder, pred: Predicate) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *MulticastBranchBuilder, ep: EndpointRef) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *MulticastBranchBuilder, uri: []const u8) !*MulticastBranchBuilder {
+        const ep = try self.mc.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn endBranch(self: *MulticastBranchBuilder) !*MulticastBuilder {
+        const rid = try self.mc.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.mc.routes.append(self.alloc(), rid);
+        return self.mc;
     }
 };

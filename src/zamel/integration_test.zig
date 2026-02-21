@@ -6,9 +6,12 @@ const Registry = zamel.Registry;
 const RtBuilder = zamel.RtBuilder;
 const Processor = zamel.Processor;
 const Predicate = zamel.Predicate;
+const Splitter = zamel.Splitter;
 const SyncExecutor = zamel.SyncExecutor;
 const RoutePlan = zamel.RoutePlan;
 const Step = zamel.Step;
+const PolicyKind = @import("step.zig").PolicyKind;
+const ChoiceBranch = @import("step.zig").ChoiceBranch;
 
 fn testClock(_: ?*anyopaque) u64 {
     return 0;
@@ -110,6 +113,7 @@ test "builder + executor: full pipeline process → filter → to" {
     try ex.setBody("hello world");
 
     var exec = SyncExecutor.init(services);
+    defer exec.deinit();
     try exec.run(&r.plan, 0, &ex);
 
     try std.testing.expectEqualStrings("HELLO WORLD", captured());
@@ -148,6 +152,7 @@ test "builder + executor: choice routes correctly" {
         try ex.putHeader("type", "A");
 
         var exec = SyncExecutor.init(services);
+        defer exec.deinit();
         try exec.run(&r.plan, rid, &ex);
 
         // Body should be uppercased
@@ -162,6 +167,7 @@ test "builder + executor: choice routes correctly" {
         try ex.putHeader("type", "B");
 
         var exec = SyncExecutor.init(services);
+        defer exec.deinit();
         try exec.run(&r.plan, rid, &ex);
 
         // Capture should have the body
@@ -191,6 +197,7 @@ test "builder + executor: retry wraps inner steps" {
     try ex.setBody("test");
 
     var exec = SyncExecutor.init(services);
+    defer exec.deinit();
     try exec.run(&r.plan, rid, &ex);
 
     try std.testing.expectEqualStrings("TEST", ex.body);
@@ -217,6 +224,7 @@ test "builder + executor: split processes each line" {
     try ex.setBody("aaa\nbbb\nccc");
 
     var exec = SyncExecutor.init(services);
+    defer exec.deinit();
     try exec.run(&r.plan, rid, &ex);
 
     // Last captured part should be "ccc"
@@ -243,6 +251,7 @@ test "builder + executor: aggregate transforms and rejoins" {
     try ex.setBody("foo,bar,baz");
 
     var exec = SyncExecutor.init(services);
+    defer exec.deinit();
     try exec.run(&r.plan, rid, &ex);
 
     try std.testing.expectEqualStrings("FOO,BAR,BAZ", ex.body);
@@ -366,4 +375,506 @@ test "file endpoint append mode" {
 
     // Cleanup
     _ = posix.system.unlink(path);
+}
+
+// -------- additional helpers --------
+
+var mock_clock_val: u64 = 0;
+
+fn mockClock(_: ?*anyopaque) u64 {
+    const v = mock_clock_val;
+    mock_clock_val += 500;
+    return v;
+}
+
+fn mockServices(alloc: std.mem.Allocator) Services {
+    return .{
+        .allocator = alloc,
+        .clock = .{ .nowMillisFn = mockClock, .ctx = null },
+    };
+}
+
+fn alwaysFailProcessor(_: ?*anyopaque, _: *Exchange) !void {
+    return error.ProcessorFailed;
+}
+
+var dl_captured_body: [256]u8 = undefined;
+var dl_captured_len: usize = 0;
+
+fn dlCaptureSend(_: ?*anyopaque, ex: *Exchange) !void {
+    @memcpy(dl_captured_body[0..ex.body.len], ex.body);
+    dl_captured_len = ex.body.len;
+}
+
+fn dlCaptureCreateProducer(_: ?*anyopaque, _: std.mem.Allocator) !zamel.Producer {
+    return .{ .ctx = null, .sendFn = dlCaptureSend };
+}
+
+// -------- timeout policy tests --------
+
+test "timeout policy fires when execution exceeds limit" {
+    const alloc = std.testing.allocator;
+    mock_clock_val = 0;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Inner route: just a no-op processor
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(captureProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    // Main route: timeout of 100ms (clock advances 500ms per call, so elapsed=500 > 100)
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .Timeout = .{ .ms = 100 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("data");
+
+    var exec = SyncExecutor.init(mockServices(alloc));
+    defer exec.deinit();
+    try std.testing.expectError(error.TimeoutExceeded, exec.run(&plan, main_rid, &ex));
+}
+
+test "timeout policy passes when within limit" {
+    const alloc = std.testing.allocator;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(uppercaseProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    // Timeout of 99999ms with clock that always returns 0 => elapsed=0 < 99999
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .Timeout = .{ .ms = 99999 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(testServices(alloc));
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// -------- dead letter policy tests --------
+
+test "dead letter catches failure and sends to endpoint" {
+    const alloc = std.testing.allocator;
+    dl_captured_len = 0;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(alwaysFailProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    const dl_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .DeadLetter = .{ .endpoint = .{ .endpoint = dl_ep } } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("failed msg");
+
+    var exec = SyncExecutor.init(testServices(alloc));
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    // Dead letter endpoint should have received the exchange body
+    try std.testing.expectEqualStrings("failed msg", dl_captured_body[0..dl_captured_len]);
+}
+
+test "dead letter does not fire on success" {
+    const alloc = std.testing.allocator;
+    dl_captured_len = 0;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(uppercaseProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    const dl_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .DeadLetter = .{ .endpoint = .{ .endpoint = dl_ep } } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("good msg");
+
+    var exec = SyncExecutor.init(testServices(alloc));
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    // Dead letter should NOT have been called
+    try std.testing.expectEqual(@as(usize, 0), dl_captured_len);
+    // Body should be uppercased normally
+    try std.testing.expectEqualStrings("GOOD MSG", ex.body);
+}
+
+// -------- circuit breaker policy tests --------
+
+test "circuit breaker opens after threshold failures" {
+    const alloc = std.testing.allocator;
+    mock_clock_val = 0;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(alwaysFailProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .CircuitBreaker = .{ .failure_threshold = 2, .reset_ms = 50000 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var exec = SyncExecutor.init(mockServices(alloc));
+    defer exec.deinit();
+
+    // First failure: failures=1
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&plan, main_rid, &ex));
+    }
+
+    // Second failure: failures=2, circuit opens
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&plan, main_rid, &ex));
+    }
+
+    // Third call: circuit is open, should get CircuitOpen without running inner route
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.CircuitOpen, exec.run(&plan, main_rid, &ex));
+    }
+}
+
+// -------- multicast tests --------
+
+test "builder + executor: multicast runs all branches" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    // Multicast: branch1 uppercases, branch2 captures
+    var mc = r.multicast();
+
+    var b1 = mc.branch();
+    _ = try (try b1.process(Processor.fromFn(uppercaseProcessor, null))).endBranch();
+
+    var b2 = mc.branch();
+    _ = try (try b2.process(Processor.fromFn(captureProcessor, null))).endBranch();
+
+    const rid = try (try mc.endMulticast()).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    // Branch 1 uppercased the body, branch 2 captured it
+    try std.testing.expectEqualStrings("HELLO", captured());
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// -------- custom splitter tests --------
+
+fn csvSplitter(_: ?*anyopaque, body: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    var it = std.mem.splitScalar(u8, body, ',');
+    while (it.next()) |part| try out.append(allocator, part);
+}
+
+test "split with custom splitter function" {
+    const alloc = std.testing.allocator;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(captureProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .Split = .{
+        .kind = .{ .custom = Splitter.fromFn(csvSplitter, null) },
+        .route = sub_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    capture_len = 0;
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("aaa,bbb,ccc");
+
+    var exec = SyncExecutor.init(testServices(alloc));
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    // Last captured part should be "ccc"
+    try std.testing.expectEqualStrings("ccc", captured());
+}
+
+test "split with sequence separator" {
+    const alloc = std.testing.allocator;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(captureProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .Split = .{
+        .kind = .{ .sequence = "::" },
+        .route = sub_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    capture_len = 0;
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("one::two::three");
+
+    var exec = SyncExecutor.init(testServices(alloc));
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    try std.testing.expectEqualStrings("three", captured());
+}
+
+test "builder: splitBy with custom splitter" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var sp = r.splitBy(Splitter.fromFn(csvSplitter, null));
+    _ = try (try sp.process(Processor.fromFn(captureProcessor, null))).endSplit();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("x,y,z");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("z", captured());
+}
+
+// -------- custom endpoint registration tests --------
+
+fn customEndpointFactory(_: std.mem.Allocator, _: []const u8) !zamel.Endpoint {
+    return .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+}
+
+test "registry: custom endpoint registration" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    try registry.registerEndpoint("custom", customEndpointFactory);
+
+    const ep = try registry.resolve(alloc, "custom:anything");
+    const producer = try ep.createProducer(alloc);
+
+    dl_captured_len = 0;
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("custom data");
+
+    try producer.send(&ex);
+
+    try std.testing.expectEqualStrings("custom data", dl_captured_body[0..dl_captured_len]);
+}
+
+test "registry: custom endpoint overrides unknown scheme error" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Without registration, "myscheme" should fail
+    try std.testing.expectError(error.UnknownEndpointScheme, registry.resolve(alloc, "myscheme:test"));
+
+    // After registration, it should succeed
+    try registry.registerEndpoint("myscheme", customEndpointFactory);
+    _ = try registry.resolve(alloc, "myscheme:test");
+}
+
+// -------- builder: timeout and deadLetter via DSL --------
+
+test "builder + executor: timeout via DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var pol = r.timeout(99999);
+    _ = try (try pol.process(Processor.fromFn(uppercaseProcessor, null))).endPolicy();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("TEST", ex.body);
+}
+
+test "builder + executor: deadLetter via DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    dl_captured_len = 0;
+
+    const dl_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    var pol = r.deadLetter(dl_ep);
+    _ = try (try pol.process(Processor.fromFn(alwaysFailProcessor, null))).endPolicy();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("oops");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("oops", dl_captured_body[0..dl_captured_len]);
+}
+
+test "builder + executor: circuitBreaker via DSL" {
+    const alloc = std.testing.allocator;
+    mock_clock_val = 0;
+    const services = mockServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var pol = r.circuitBreaker(1, 50000);
+    _ = try (try pol.process(Processor.fromFn(alwaysFailProcessor, null))).endPolicy();
+
+    const rid = try r.build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First call: fails, opens circuit (threshold=1)
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&r.plan, rid, &ex));
+    }
+
+    // Second call: circuit is open
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.CircuitOpen, exec.run(&r.plan, rid, &ex));
+    }
+}
+
+test "builder: splitSequence via DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var sp = r.splitSequence("::");
+    _ = try (try sp.process(Processor.fromFn(captureProcessor, null))).endSplit();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("a::b::c");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("c", captured());
 }

@@ -10,41 +10,69 @@ const RoutePlan = @import("plan.zig").RoutePlan;
 const SyncExecutor = @import("executor_sync.zig").SyncExecutor;
 const Services = @import("services.zig").Services;
 
+pub const EndpointFactory = *const fn (allocator: std.mem.Allocator, rest: []const u8) anyerror!Endpoint;
+pub const ConsumerFactory = *const fn (allocator: std.mem.Allocator, rest: []const u8) anyerror!Consumer;
+
 pub const Registry = struct {
     services: Services,
     cache: std.StringHashMap(Endpoint),
+    endpoint_factories: std.StringHashMap(EndpointFactory),
+    consumer_factories: std.StringHashMap(ConsumerFactory),
 
     pub fn init(services: Services) Registry {
         return .{
             .services = services,
             .cache = std.StringHashMap(Endpoint).init(services.allocator),
+            .endpoint_factories = std.StringHashMap(EndpointFactory).init(services.allocator),
+            .consumer_factories = std.StringHashMap(ConsumerFactory).init(services.allocator),
         };
     }
 
     pub fn deinit(self: *Registry) void {
-        var it = self.cache.keyIterator();
-        while (it.next()) |key_ptr| self.services.allocator.free(key_ptr.*);
+        // Free cached endpoint contexts and keys
+        var it = self.cache.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.services.allocator);
+            self.services.allocator.free(entry.key_ptr.*);
+        }
         self.cache.deinit();
+        self.endpoint_factories.deinit();
+        self.consumer_factories.deinit();
+    }
+
+    /// Register a custom endpoint scheme.
+    pub fn registerEndpoint(self: *Registry, scheme: []const u8, factory: EndpointFactory) !void {
+        try self.endpoint_factories.put(scheme, factory);
+    }
+
+    /// Register a custom consumer (source) scheme.
+    pub fn registerConsumer(self: *Registry, scheme: []const u8, factory: ConsumerFactory) !void {
+        try self.consumer_factories.put(scheme, factory);
     }
 
     pub fn resolve(self: *Registry, allocator: std.mem.Allocator, uri: []const u8) !Endpoint {
+        _ = allocator;
         if (self.cache.get(uri)) |cached| return cached;
 
+        const alloc = self.services.allocator;
         const parsed = try parseUri(uri);
+
         const ep = if (std.mem.eql(u8, parsed.scheme, "log"))
-            try makeLogEndpoint(allocator, parsed.rest)
+            try makeLogEndpoint(alloc, parsed.rest)
         else if (std.mem.eql(u8, parsed.scheme, "file"))
-            try makeFileEndpoint(allocator, parsed.rest)
+            try makeFileEndpoint(alloc, parsed.rest)
+        else if (self.endpoint_factories.get(parsed.scheme)) |factory|
+            try factory(alloc, parsed.rest)
         else
             return error.UnknownEndpointScheme;
 
-        const key = try self.services.allocator.dupe(u8, uri);
+        const key = try alloc.dupe(u8, uri);
         try self.cache.put(key, ep);
         return ep;
     }
 
     /// Resolves a source URI to a Consumer.
-    pub fn resolveConsumer(_: *Registry, allocator: std.mem.Allocator, uri: []const u8) !Consumer {
+    pub fn resolveConsumer(self: *Registry, allocator: std.mem.Allocator, uri: []const u8) !Consumer {
         const parsed = try parseUri(uri);
         if (std.mem.eql(u8, parsed.scheme, "timer")) {
             const cfg = try parseTimer(parsed.rest);
@@ -52,6 +80,9 @@ pub const Registry = struct {
         }
         if (std.mem.eql(u8, parsed.scheme, "file")) {
             return try consumers.fileReader(allocator, parsed.rest);
+        }
+        if (self.consumer_factories.get(parsed.scheme)) |factory| {
+            return try factory(allocator, parsed.rest);
         }
         return error.UnsupportedSource;
     }
@@ -92,7 +123,14 @@ fn makeLogEndpoint(allocator: std.mem.Allocator, rest: []const u8) !Endpoint {
     return .{
         .ctx = p,
         .createProducerFn = logCreateProducer,
+        .deinitFn = logDeinit,
     };
+}
+
+fn logDeinit(ctx: ?*anyopaque, allocator: std.mem.Allocator) void {
+    const Ctx = struct { lvl: LogLevel };
+    const p: *Ctx = @ptrCast(@alignCast(ctx.?));
+    allocator.destroy(p);
 }
 
 fn parseLogLevel(rest: []const u8) LogLevel {
@@ -169,7 +207,12 @@ fn makeFileEndpoint(allocator: std.mem.Allocator, rest: []const u8) !Endpoint {
 
     const p = try allocator.create(FileCtx);
     p.* = .{ .path = path, .append = append };
-    return .{ .ctx = p, .createProducerFn = fileCreateProducer };
+    return .{ .ctx = p, .createProducerFn = fileCreateProducer, .deinitFn = fileDeinit };
+}
+
+fn fileDeinit(ctx: ?*anyopaque, allocator: std.mem.Allocator) void {
+    const p: *FileCtx = @ptrCast(@alignCast(ctx.?));
+    allocator.destroy(p);
 }
 
 fn fileCreateProducer(ctx: ?*anyopaque, allocator: std.mem.Allocator) !Producer {

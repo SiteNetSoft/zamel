@@ -2,6 +2,7 @@ const std = @import("std");
 const Predicate = @import("predicate.zig").Predicate;
 const Processor = @import("processor.zig").Processor;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
+const Splitter = @import("splitter.zig").Splitter;
 
 pub const RouteId = u32;
 
@@ -27,9 +28,9 @@ pub const Step = union(enum) {
         parallel: bool = false, // executor can ignore until async exists
     },
 
-    // Message splitting: splits body by delimiter, runs sub-route per part
+    // Message splitting: splits body by kind, runs sub-route per part
     Split: struct {
-        delimiter: u8 = '\n',
+        kind: SplitKind = .{ .scalar = '\n' },
         route: RouteId,
     },
 
@@ -44,6 +45,12 @@ pub const Step = union(enum) {
         kind: PolicyKind,
         route: RouteId,
     },
+};
+
+pub const SplitKind = union(enum) {
+    scalar: u8,
+    sequence: []const u8,
+    custom: Splitter,
 };
 
 pub const PolicyKind = union(enum) {

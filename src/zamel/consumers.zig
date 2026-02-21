@@ -30,6 +30,7 @@ fn timerStart(ctx: ?*anyopaque, allocator: std.mem.Allocator, services: Services
     const cfg: *const TimerCtx = @ptrCast(@alignCast(ctx.?));
 
     var exec = SyncExecutor.init(services);
+    defer exec.deinit();
 
     var i: u64 = 0;
     while (cfg.repeat == 0 or i < cfg.repeat) : (i += 1) {
@@ -103,6 +104,7 @@ fn fileReaderStart(ctx: ?*anyopaque, allocator: std.mem.Allocator, services: Ser
     const content = content_list.items;
 
     var exec = SyncExecutor.init(services);
+    defer exec.deinit();
     var line_num: u64 = 0;
 
     var it = std.mem.splitScalar(u8, content, '\n');
