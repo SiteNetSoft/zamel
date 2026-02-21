@@ -27,18 +27,16 @@ pub const Step = union(enum) {
         parallel: bool = false, // executor can ignore until async exists
     },
 
-    // Message splitting:
+    // Message splitting: splits body by delimiter, runs sub-route per part
     Split: struct {
-        splitter: Processor,   // MVP: splitter writes split list into headers or a store; later make a real Splitter type
+        delimiter: u8 = '\n',
         route: RouteId,
-        parallel: bool = false,
     },
 
-    // Fan-in / stateful (placeholder now, enables future):
+    // Aggregation: runs sub-route, then joins all resulting bodies
     Aggregate: struct {
-        correlation: Predicate, // placeholder; later replace with CorrelationKey extractor
+        separator: []const u8 = "\n",
         route: RouteId,
-        completion_timeout_ms: u64 = 0,
     },
 
     // Policies (wrapper around a child route):

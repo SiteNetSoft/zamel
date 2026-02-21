@@ -32,7 +32,9 @@ pub const Registry = struct {
 
         const parsed = try parseUri(uri);
         const ep = if (std.mem.eql(u8, parsed.scheme, "log"))
-            makeLogEndpoint(allocator, parsed.rest)
+            try makeLogEndpoint(allocator, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "file"))
+            try makeFileEndpoint(allocator, parsed.rest)
         else
             return error.UnknownEndpointScheme;
 
@@ -46,7 +48,10 @@ pub const Registry = struct {
         const parsed = try parseUri(uri);
         if (std.mem.eql(u8, parsed.scheme, "timer")) {
             const cfg = try parseTimer(parsed.rest);
-            return consumers.timer(allocator, cfg.interval_ms, cfg.repeat);
+            return try consumers.timer(allocator, cfg.interval_ms, cfg.repeat);
+        }
+        if (std.mem.eql(u8, parsed.scheme, "file")) {
+            return try consumers.fileReader(allocator, parsed.rest);
         }
         return error.UnsupportedSource;
     }
@@ -77,18 +82,15 @@ fn parseUri(uri: []const u8) !ParsedUri {
 
 const LogLevel = enum { debug, info, warn, err };
 
-fn makeLogEndpoint(allocator: std.mem.Allocator, rest: []const u8) Endpoint {
+fn makeLogEndpoint(allocator: std.mem.Allocator, rest: []const u8) !Endpoint {
     const lvl = parseLogLevel(rest);
 
     const Ctx = struct { lvl: LogLevel };
-    const ctx_ptr = blk: {
-        const p = allocator.create(Ctx) catch unreachable;
-        p.* = .{ .lvl = lvl };
-        break :blk p;
-    };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .lvl = lvl };
 
     return .{
-        .ctx = ctx_ptr,
+        .ctx = p,
         .createProducerFn = logCreateProducer,
     };
 }
@@ -142,4 +144,62 @@ fn parseTimer(rest: []const u8) !TimerCfg {
 
     const interval_ms = try std.fmt.parseUnsigned(u64, interval_part, 10);
     return .{ .interval_ms = interval_ms, .repeat = repeat };
+}
+
+// -------- file endpoint --------
+// URI: "file:path/to/file" or "file:/absolute/path"
+// Query: ?append=true (default: overwrite)
+
+const posix = std.posix;
+
+const FileCtx = struct {
+    path: []const u8,
+    append: bool,
+};
+
+fn makeFileEndpoint(allocator: std.mem.Allocator, rest: []const u8) !Endpoint {
+    var path = rest;
+    var append = false;
+
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        path = rest[0..q];
+        const query = rest[q + 1 ..];
+        if (std.mem.eql(u8, query, "append=true")) append = true;
+    }
+
+    const p = try allocator.create(FileCtx);
+    p.* = .{ .path = path, .append = append };
+    return .{ .ctx = p, .createProducerFn = fileCreateProducer };
+}
+
+fn fileCreateProducer(ctx: ?*anyopaque, allocator: std.mem.Allocator) !Producer {
+    _ = allocator;
+    return .{ .ctx = ctx, .sendFn = fileSend };
+}
+
+fn fileSend(ctx: ?*anyopaque, ex: *Exchange) !void {
+    const c: *const FileCtx = @ptrCast(@alignCast(ctx.?));
+
+    const flags: posix.O = if (c.append)
+        .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }
+    else
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+
+    const fd = try posix.openat(posix.AT.FDCWD, c.path, flags, 0o644);
+    defer posix.close(fd);
+
+    writeAll(fd, ex.body);
+    if (c.append) writeAll(fd, "\n");
+}
+
+fn writeAll(fd: posix.fd_t, data: []const u8) void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = posix.system.write(fd, data.ptr + written, data.len - written);
+        switch (posix.errno(rc)) {
+            .SUCCESS => written += rc,
+            .INTR => continue,
+            else => return,
+        }
+    }
 }

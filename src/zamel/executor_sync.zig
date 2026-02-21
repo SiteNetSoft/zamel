@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const Exchange = @import("exchange.zig").Exchange;
 const Services = @import("services.zig").Services;
 const RoutePlan = @import("plan.zig").RoutePlan;
@@ -41,12 +40,57 @@ pub const SyncExecutor = struct {
                     for (m.routes) |rid| try self.run(plan, rid, ex);
                 },
 
-                .Split => {
-                    return error.NotImplemented;
+                .Split => |s| {
+                    // Split body by delimiter, run sub-route for each part
+                    var it = std.mem.splitScalar(u8, ex.body, s.delimiter);
+                    var idx: u32 = 0;
+                    while (it.next()) |part| {
+                        var child = Exchange.init(ex.allocator);
+                        defer child.deinit();
+                        try child.setBody(part);
+
+                        // Copy headers from parent
+                        var hit = ex.headers.iterator();
+                        while (hit.next()) |e| try child.putHeader(e.key_ptr.*, e.value_ptr.*);
+
+                        // Set split metadata headers
+                        var idx_buf: [16]u8 = undefined;
+                        const idx_str = try std.fmt.bufPrint(&idx_buf, "{d}", .{idx});
+                        try child.putHeader("CamelSplitIndex", idx_str);
+
+                        try self.run(plan, s.route, &child);
+                        idx += 1;
+                    }
                 },
 
-                .Aggregate => {
-                    return error.NotImplemented;
+                .Aggregate => |a| {
+                    // Split body by separator, run sub-route on each part,
+                    // then join the resulting bodies back with separator
+                    var parts: std.ArrayList([]u8) = .empty;
+                    defer {
+                        for (parts.items) |p| ex.allocator.free(p);
+                        parts.deinit(ex.allocator);
+                    }
+
+                    var it = std.mem.splitSequence(u8, ex.body, a.separator);
+                    while (it.next()) |part| {
+                        var child = Exchange.init(ex.allocator);
+                        defer child.deinit();
+                        try child.setBody(part);
+
+                        var hit = ex.headers.iterator();
+                        while (hit.next()) |e| try child.putHeader(e.key_ptr.*, e.value_ptr.*);
+
+                        try self.run(plan, a.route, &child);
+
+                        // Collect the result
+                        try parts.append(ex.allocator, try ex.allocator.dupe(u8, child.body));
+                    }
+
+                    // Join results back into parent body
+                    const joined = try std.mem.join(ex.allocator, a.separator, parts.items);
+                    if (ex.body.len != 0) ex.allocator.free(ex.body);
+                    ex.body = joined;
                 },
 
                 .Policy => |pol| {
@@ -60,7 +104,7 @@ pub const SyncExecutor = struct {
                                 } else |err| {
                                     last_err = err;
                                     if (retry.backoff_ms > 0) {
-                                        sleepMs(@as(u64, retry.backoff_ms));
+                                        @import("time_util.zig").sleepMs(@as(u64, retry.backoff_ms));
                                     }
                                 }
                             }
@@ -71,18 +115,6 @@ pub const SyncExecutor = struct {
                         .CircuitBreaker => return error.NotImplemented,
                     }
                 },
-            }
-        }
-    }
-
-    fn sleepMs(ms: u64) void {
-        const ns = ms * std.time.ns_per_ms;
-        var req = posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-        while (true) {
-            switch (posix.errno(posix.system.nanosleep(&req, &req))) {
-                .SUCCESS => return,
-                .INTR => continue,
-                else => unreachable,
             }
         }
     }
@@ -256,4 +288,53 @@ test "Retry returns error when all attempts fail" {
     var exec = SyncExecutor.init(testServices());
     const result = exec.run(&plan, main_rid, &ex);
     try std.testing.expectError(error.TransientFailure, result);
+}
+
+test "Split processes each part independently" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Sub-route: appends X to each split part
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    // Main route: split by newline
+    var main_steps = [_]Step{.{ .Split = .{ .delimiter = '\n', .route = sub_rid } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("aaa\nbbb\nccc");
+    try ex.putHeader("key", "val");
+
+    var exec = SyncExecutor.init(testServices());
+    try exec.run(&plan, main_rid, &ex);
+
+    // Split doesn't modify parent body (it runs sub-routes on copies)
+    try std.testing.expectEqualStrings("aaa\nbbb\nccc", ex.body);
+}
+
+test "Aggregate transforms and rejoins body" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Sub-route: appends X to each part
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    // Main route: aggregate by newline
+    var main_steps = [_]Step{.{ .Aggregate = .{ .separator = "\n", .route = sub_rid } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("aaa\nbbb\nccc");
+
+    var exec = SyncExecutor.init(testServices());
+    try exec.run(&plan, main_rid, &ex);
+
+    // Each part should have X appended, then rejoined
+    try std.testing.expectEqualStrings("aaaX\nbbbX\ncccX", ex.body);
 }

@@ -1,11 +1,13 @@
 const std = @import("std");
 const Step = @import("step.zig").Step;
 const ChoiceBranch = @import("step.zig").ChoiceBranch;
+const PolicyKind = @import("step.zig").PolicyKind;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const RouteId = @import("step.zig").RouteId;
 
 const Predicate = @import("predicate.zig").Predicate;
 const Processor = @import("processor.zig").Processor;
+const Endpoint = @import("endpoint.zig").Endpoint;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 
 const Registry = @import("registry.zig").Registry;
@@ -75,6 +77,43 @@ pub const RtBuilder = struct {
 
     pub fn choice(self: *RtBuilder) ChoiceBuilder {
         return ChoiceBuilder.init(self);
+    }
+
+    // ---- split / aggregate DSL ----
+
+    pub fn split(self: *RtBuilder, delimiter: u8) SplitBuilder {
+        return SplitBuilder.init(self, delimiter);
+    }
+
+    pub fn splitLines(self: *RtBuilder) SplitBuilder {
+        return SplitBuilder.init(self, '\n');
+    }
+
+    pub fn aggregate(self: *RtBuilder, separator: []const u8) AggregateBuilder {
+        return AggregateBuilder.init(self, separator);
+    }
+
+    // ---- policy DSL ----
+
+    pub fn retry(self: *RtBuilder, max: u32, backoff_ms: u32) PolicyBuilder {
+        return PolicyBuilder.init(self, .{ .Retry = .{ .max = max, .backoff_ms = backoff_ms } });
+    }
+
+    pub fn timeout(self: *RtBuilder, ms: u32) PolicyBuilder {
+        return PolicyBuilder.init(self, .{ .Timeout = .{ .ms = ms } });
+    }
+
+    pub fn deadLetter(self: *RtBuilder, ep: Endpoint) PolicyBuilder {
+        return PolicyBuilder.init(self, .{ .DeadLetter = .{ .endpoint = .{ .endpoint = ep } } });
+    }
+
+    pub fn deadLetterUri(self: *RtBuilder, uri: []const u8) !PolicyBuilder {
+        const ep = try self.registry.resolve(self.arena.allocator(), uri);
+        return PolicyBuilder.init(self, .{ .DeadLetter = .{ .endpoint = .{ .endpoint = ep } } });
+    }
+
+    pub fn circuitBreaker(self: *RtBuilder, failure_threshold: u32, reset_ms: u32) PolicyBuilder {
+        return PolicyBuilder.init(self, .{ .CircuitBreaker = .{ .failure_threshold = failure_threshold, .reset_ms = reset_ms } });
     }
 
     // ---- finalize ----
@@ -190,6 +229,16 @@ pub const OtherwiseBuilder = struct {
         return try self.to(.{ .endpoint = ep });
     }
 
+    pub fn process(self: *OtherwiseBuilder, p: Processor) !*OtherwiseBuilder {
+        try self.steps.append(self.choice.parent.arena.allocator(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *OtherwiseBuilder, pred: Predicate) !*OtherwiseBuilder {
+        try self.steps.append(self.choice.parent.arena.allocator(), .{ .Filter = pred });
+        return self;
+    }
+
     pub fn endOtherwise(self: *OtherwiseBuilder) !*ChoiceBuilder {
         const rid = try self.choice.parent.plan.addRoute(
             self.choice.parent.arena.allocator(),
@@ -197,5 +246,146 @@ pub const OtherwiseBuilder = struct {
         );
         self.choice.otherwise_route = rid;
         return self.choice;
+    }
+};
+
+pub const PolicyBuilder = struct {
+    parent: *RtBuilder,
+    kind: PolicyKind,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder, kind: PolicyKind) PolicyBuilder {
+        return .{
+            .parent = parent,
+            .kind = kind,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *PolicyBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *PolicyBuilder, p: Processor) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *PolicyBuilder, pred: Predicate) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *PolicyBuilder, ep: EndpointRef) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *PolicyBuilder, uri: []const u8) !*PolicyBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn endPolicy(self: *PolicyBuilder) !*RtBuilder {
+        const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.parent.cur_steps.append(self.alloc(), .{ .Policy = .{
+            .kind = self.kind,
+            .route = rid,
+        } });
+        return self.parent;
+    }
+};
+
+pub const SplitBuilder = struct {
+    parent: *RtBuilder,
+    delimiter: u8,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder, delimiter: u8) SplitBuilder {
+        return .{
+            .parent = parent,
+            .delimiter = delimiter,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *SplitBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *SplitBuilder, p: Processor) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *SplitBuilder, pred: Predicate) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *SplitBuilder, ep: EndpointRef) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *SplitBuilder, uri: []const u8) !*SplitBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn endSplit(self: *SplitBuilder) !*RtBuilder {
+        const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.parent.cur_steps.append(self.alloc(), .{ .Split = .{
+            .delimiter = self.delimiter,
+            .route = rid,
+        } });
+        return self.parent;
+    }
+};
+
+pub const AggregateBuilder = struct {
+    parent: *RtBuilder,
+    separator: []const u8,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder, separator: []const u8) AggregateBuilder {
+        return .{
+            .parent = parent,
+            .separator = separator,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *AggregateBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *AggregateBuilder, p: Processor) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *AggregateBuilder, pred: Predicate) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *AggregateBuilder, ep: EndpointRef) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *AggregateBuilder, uri: []const u8) !*AggregateBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn endAggregate(self: *AggregateBuilder) !*RtBuilder {
+        const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.parent.cur_steps.append(self.alloc(), .{ .Aggregate = .{
+            .separator = self.separator,
+            .route = rid,
+        } });
+        return self.parent;
     }
 };

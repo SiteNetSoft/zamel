@@ -18,3 +18,8 @@ pub const RtBuilder = @import("builder_rt.zig").RtBuilder;
 
 pub const consumers = @import("consumers.zig");
 pub const pred = @import("predicates.zig");
+pub const time_util = @import("time_util.zig");
+
+test {
+    _ = @import("integration_test.zig");
+}

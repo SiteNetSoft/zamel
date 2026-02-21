@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const Consumer = @import("consumer.zig").Consumer;
 const Exchange = @import("exchange.zig").Exchange;
 const RoutePlan = @import("plan.zig").RoutePlan;
@@ -11,15 +10,12 @@ pub const TimerCtx = struct {
     repeat: u64,
 };
 
-pub fn timer(allocator: std.mem.Allocator, interval_ms: u64, repeat: u64) Consumer {
-    const ctx_ptr = blk: {
-        const p = allocator.create(TimerCtx) catch unreachable;
-        p.* = .{ .interval_ms = interval_ms, .repeat = repeat };
-        break :blk p;
-    };
+pub fn timer(allocator: std.mem.Allocator, interval_ms: u64, repeat: u64) !Consumer {
+    const p = try allocator.create(TimerCtx);
+    p.* = .{ .interval_ms = interval_ms, .repeat = repeat };
 
     return .{
-        .ctx = ctx_ptr,
+        .ctx = p,
         .startFn = timerStart,
         .deinitFn = timerDeinit,
     };
@@ -55,18 +51,75 @@ fn timerStart(ctx: ?*anyopaque, allocator: std.mem.Allocator, services: Services
 
         try exec.run(plan, @intCast(route_id), &ex);
 
-        sleepMs(cfg.interval_ms);
+        @import("time_util.zig").sleepMs(cfg.interval_ms);
     }
 }
 
-fn sleepMs(ms: u64) void {
-    const ns = ms * std.time.ns_per_ms;
-    var req = posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+// -------- file reader consumer --------
+// Reads a file and creates one Exchange per line.
+// URI: "file:path/to/file"
+
+const FileReaderCtx = struct {
+    path: []const u8,
+};
+
+pub fn fileReader(allocator: std.mem.Allocator, path: []const u8) !Consumer {
+    const p = try allocator.create(FileReaderCtx);
+    p.* = .{ .path = path };
+    return .{
+        .ctx = p,
+        .startFn = fileReaderStart,
+        .deinitFn = fileReaderDeinit,
+    };
+}
+
+fn fileReaderDeinit(ctx: ?*anyopaque, allocator: std.mem.Allocator) void {
+    const p: *FileReaderCtx = @ptrCast(@alignCast(ctx.?));
+    allocator.destroy(p);
+}
+
+fn fileReaderStart(ctx: ?*anyopaque, allocator: std.mem.Allocator, services: Services, plan: *const RoutePlan, route_id: u32) !void {
+    const cfg: *const FileReaderCtx = @ptrCast(@alignCast(ctx.?));
+    const posix = std.posix;
+
+    // Read entire file via posix
+    const fd = try posix.openat(posix.AT.FDCWD, cfg.path, .{ .ACCMODE = .RDONLY }, 0);
+    defer posix.close(fd);
+
+    var content_list: std.ArrayList(u8) = .empty;
+    defer content_list.deinit(allocator);
+    var read_buf: [4096]u8 = undefined;
     while (true) {
-        switch (posix.errno(posix.system.nanosleep(&req, &req))) {
-            .SUCCESS => return,
+        const rc = posix.system.read(fd, &read_buf, read_buf.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) break;
+                try content_list.appendSlice(allocator, read_buf[0..rc]);
+            },
             .INTR => continue,
-            else => unreachable,
+            else => break,
         }
+    }
+    const content = content_list.items;
+
+    var exec = SyncExecutor.init(services);
+    var line_num: u64 = 0;
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+
+        var ex = Exchange.init(allocator);
+        defer ex.deinit();
+
+        try ex.setBody(line);
+
+        var num_buf: [16]u8 = undefined;
+        const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{line_num});
+        try ex.putHeader("CamelFileLineNumber", num_str);
+        try ex.putHeader("CamelFileName", cfg.path);
+
+        try exec.run(plan, @intCast(route_id), &ex);
+        line_num += 1;
     }
 }

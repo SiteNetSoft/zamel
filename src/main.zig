@@ -29,11 +29,11 @@ pub fn main() !void {
     var c2 = route.choice();
 
     // branch 1
-    var w1 = c2.when(zamel.pred.headerEq(r.arena.allocator(), "type", "A"));
+    var w1 = c2.when(try zamel.pred.headerEq(r.arena.allocator(), "type", "A"));
     _ = try (try w1.toUri("log:info")).endWhen();
 
     // branch 2
-    var w2 = c2.when(zamel.pred.bodyContains(r.arena.allocator(), "tick 3"));
+    var w2 = c2.when(try zamel.pred.bodyContains(r.arena.allocator(), "tick 3"));
     _ = try (try w2.toUri("log:debug")).endWhen();
 
     // otherwise
