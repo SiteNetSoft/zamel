@@ -14,6 +14,7 @@ const Endpoint = @import("endpoint.zig").Endpoint;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 
 const Registry = @import("registry.zig").Registry;
+const processors = @import("processors.zig");
 
 pub const RtBuilder = struct {
     gpa: std.mem.Allocator,
@@ -55,6 +56,18 @@ pub const RtBuilder = struct {
     pub fn process(self: *RtBuilder, p: Processor) !*RtBuilder {
         try self.cur_steps.append(self.arena.allocator(), .{ .Process = p });
         return self;
+    }
+
+    pub fn setBody(self: *RtBuilder, value: []const u8) !*RtBuilder {
+        return try self.process(try processors.setBody(self.arena.allocator(), value));
+    }
+
+    pub fn setHeader(self: *RtBuilder, key: []const u8, value: []const u8) !*RtBuilder {
+        return try self.process(try processors.setHeader(self.arena.allocator(), key, value));
+    }
+
+    pub fn removeHeader(self: *RtBuilder, key: []const u8) !*RtBuilder {
+        return try self.process(try processors.removeHeader(self.arena.allocator(), key));
     }
 
     pub fn to(self: *RtBuilder, ep: EndpointRef) !*RtBuilder {
@@ -162,11 +175,34 @@ pub const RtBuilder = struct {
         return PolicyBuilder.init(self, .{ .CircuitBreaker = .{ .failure_threshold = failure_threshold, .reset_ms = reset_ms } });
     }
 
+    // ---- idempotent DSL ----
+
+    pub fn idempotent(self: *RtBuilder, key_header: []const u8) IdempotentBuilder {
+        return IdempotentBuilder.init(self, key_header);
+    }
+
+    // ---- enrich ----
+
+    pub fn enrich(self: *RtBuilder, ep: EndpointRef, merge: ?Processor) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *RtBuilder, uri: []const u8, merge: ?Processor) !*RtBuilder {
+        const ep = try self.registry.resolve(self.arena.allocator(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
     // ---- finalize ----
 
     pub fn build(self: *RtBuilder) !RouteId {
         const steps_slice = self.cur_steps.items;
         return try self.plan.addRoute(self.arena.allocator(), steps_slice);
+    }
+
+    pub fn register(self: *RtBuilder, name: []const u8) !void {
+        const route_id = try self.build();
+        try self.registry.registerRoute(name, &self.plan, route_id);
     }
 
     pub fn start(self: *RtBuilder) !void {
@@ -248,6 +284,28 @@ pub const WhenBuilder = struct {
         return self;
     }
 
+    pub fn setBody(self: *WhenBuilder, value: []const u8) !*WhenBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *WhenBuilder, key: []const u8, value: []const u8) !*WhenBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *WhenBuilder, key: []const u8) !*WhenBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn enrich(self: *WhenBuilder, ep: EndpointRef, merge: ?Processor) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *WhenBuilder, uri: []const u8, merge: ?Processor) !*WhenBuilder {
+        const ep = try self.choice.parent.registry.resolve(self.alloc(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
     pub fn endWhen(self: *WhenBuilder) !*ChoiceBuilder {
         const a = self.alloc();
         const rid = try self.choice.parent.plan.addRoute(a, self.steps.items);
@@ -289,6 +347,28 @@ pub const OtherwiseBuilder = struct {
     pub fn filter(self: *OtherwiseBuilder, pred: Predicate) !*OtherwiseBuilder {
         try self.steps.append(self.alloc(), .{ .Filter = pred });
         return self;
+    }
+
+    pub fn setBody(self: *OtherwiseBuilder, value: []const u8) !*OtherwiseBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *OtherwiseBuilder, key: []const u8, value: []const u8) !*OtherwiseBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *OtherwiseBuilder, key: []const u8) !*OtherwiseBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn enrich(self: *OtherwiseBuilder, ep: EndpointRef, merge: ?Processor) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *OtherwiseBuilder, uri: []const u8, merge: ?Processor) !*OtherwiseBuilder {
+        const ep = try self.choice.parent.registry.resolve(self.alloc(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
     pub fn endOtherwise(self: *OtherwiseBuilder) !*ChoiceBuilder {
@@ -333,6 +413,28 @@ pub const PolicyBuilder = struct {
     pub fn toUri(self: *PolicyBuilder, uri: []const u8) !*PolicyBuilder {
         const ep = try self.parent.registry.resolve(self.alloc(), uri);
         return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *PolicyBuilder, value: []const u8) !*PolicyBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *PolicyBuilder, key: []const u8, value: []const u8) !*PolicyBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *PolicyBuilder, key: []const u8) !*PolicyBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn enrich(self: *PolicyBuilder, ep: EndpointRef, merge: ?Processor) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *PolicyBuilder, uri: []const u8, merge: ?Processor) !*PolicyBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
     pub fn endPolicy(self: *PolicyBuilder) !*RtBuilder {
@@ -382,6 +484,28 @@ pub const SplitBuilder = struct {
         return try self.to(.{ .endpoint = ep });
     }
 
+    pub fn setBody(self: *SplitBuilder, value: []const u8) !*SplitBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *SplitBuilder, key: []const u8, value: []const u8) !*SplitBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *SplitBuilder, key: []const u8) !*SplitBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn enrich(self: *SplitBuilder, ep: EndpointRef, merge: ?Processor) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *SplitBuilder, uri: []const u8, merge: ?Processor) !*SplitBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
     pub fn endSplit(self: *SplitBuilder) !*RtBuilder {
         const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.parent.cur_steps.append(self.alloc(), .{ .Split = .{
@@ -427,6 +551,28 @@ pub const AggregateBuilder = struct {
     pub fn toUri(self: *AggregateBuilder, uri: []const u8) !*AggregateBuilder {
         const ep = try self.parent.registry.resolve(self.alloc(), uri);
         return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *AggregateBuilder, value: []const u8) !*AggregateBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *AggregateBuilder, key: []const u8, value: []const u8) !*AggregateBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *AggregateBuilder, key: []const u8) !*AggregateBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn enrich(self: *AggregateBuilder, ep: EndpointRef, merge: ?Processor) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *AggregateBuilder, uri: []const u8, merge: ?Processor) !*AggregateBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
     pub fn endAggregate(self: *AggregateBuilder) !*RtBuilder {
@@ -501,9 +647,90 @@ pub const MulticastBranchBuilder = struct {
         return try self.to(.{ .endpoint = ep });
     }
 
+    pub fn setBody(self: *MulticastBranchBuilder, value: []const u8) !*MulticastBranchBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *MulticastBranchBuilder, key: []const u8, value: []const u8) !*MulticastBranchBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *MulticastBranchBuilder, key: []const u8) !*MulticastBranchBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn enrich(self: *MulticastBranchBuilder, ep: EndpointRef, merge: ?Processor) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Enrich = .{ .endpoint = ep, .merge = merge } });
+        return self;
+    }
+
+    pub fn enrichUri(self: *MulticastBranchBuilder, uri: []const u8, merge: ?Processor) !*MulticastBranchBuilder {
+        const ep = try self.mc.parent.registry.resolve(self.alloc(), uri);
+        return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
     pub fn endBranch(self: *MulticastBranchBuilder) !*MulticastBuilder {
         const rid = try self.mc.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.mc.routes.append(self.alloc(), rid);
         return self.mc;
+    }
+};
+
+pub const IdempotentBuilder = struct {
+    parent: *RtBuilder,
+    key_header: []const u8,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder, key_header: []const u8) IdempotentBuilder {
+        return .{
+            .parent = parent,
+            .key_header = key_header,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *IdempotentBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *IdempotentBuilder, p: Processor) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *IdempotentBuilder, pred: Predicate) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *IdempotentBuilder, ep: EndpointRef) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *IdempotentBuilder, uri: []const u8) !*IdempotentBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *IdempotentBuilder, value: []const u8) !*IdempotentBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *IdempotentBuilder, key: []const u8, value: []const u8) !*IdempotentBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *IdempotentBuilder, key: []const u8) !*IdempotentBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn endIdempotent(self: *IdempotentBuilder) !*RtBuilder {
+        const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.parent.cur_steps.append(self.alloc(), .{ .IdempotentConsumer = .{
+            .key_header = self.key_header,
+            .route = rid,
+        } });
+        return self.parent;
     }
 };

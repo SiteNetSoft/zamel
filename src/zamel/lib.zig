@@ -16,6 +16,8 @@ pub const SplitKind = @import("step.zig").SplitKind;
 pub const RoutePlan = @import("plan.zig").RoutePlan;
 
 pub const Services = @import("services.zig").Services;
+pub const StateStore = @import("services.zig").StateStore;
+pub const InMemoryStore = @import("state_store.zig").InMemoryStore;
 pub const SyncExecutor = @import("executor_sync.zig").SyncExecutor;
 
 pub const Registry = @import("registry.zig").Registry;
@@ -23,7 +25,9 @@ pub const RtBuilder = @import("builder_rt.zig").RtBuilder;
 
 pub const consumers = @import("consumers.zig");
 pub const pred = @import("predicates.zig");
+pub const proc = @import("processors.zig");
 pub const time_util = @import("time_util.zig");
+pub const SedaQueue = @import("seda.zig").SedaQueue;
 
 test {
     _ = @import("integration_test.zig");

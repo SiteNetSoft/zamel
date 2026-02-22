@@ -144,6 +144,41 @@ pub const SyncExecutor = struct {
                     @import("time_util.zig").sleepMs(@as(u64, t.interval_ms));
                 },
 
+                .IdempotentConsumer => |ic| {
+                    const store = self.services.store orelse return error.StateStoreRequired;
+                    const key_val = ex.getHeader(ic.key_header) orelse return error.IdempotentKeyMissing;
+                    // Check if already seen
+                    if (try store.get(ex.allocator, key_val)) |existing| {
+                        ex.allocator.free(existing);
+                        // Duplicate — skip
+                    } else {
+                        // First time — store and execute
+                        try store.put(key_val, "1");
+                        try self.run(plan, ic.route, ex);
+                    }
+                },
+
+                .Enrich => |e| {
+                    // Save original body
+                    const original = try ex.allocator.dupe(u8, ex.body);
+
+                    // Send to enrichment endpoint (modifies exchange body)
+                    try self.sendTo(e.endpoint, ex);
+
+                    if (e.merge) |merge_proc| {
+                        // Set header with original body for merge processor
+                        try ex.putHeader("CamelEnrichOriginalBody", original);
+                        ex.allocator.free(original);
+                        try merge_proc.call(ex);
+                        // Clean up the temporary header
+                        if (ex.headers.get("CamelEnrichOriginalBody")) |hval| ex.allocator.free(hval);
+                        _ = ex.headers.remove("CamelEnrichOriginalBody");
+                    } else {
+                        ex.allocator.free(original);
+                        // No merge — enriched body remains as-is
+                    }
+                },
+
                 .Policy => |pol| {
                     switch (pol.kind) {
                         .Retry => |retry| {

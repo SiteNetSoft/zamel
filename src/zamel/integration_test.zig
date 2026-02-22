@@ -14,6 +14,8 @@ const RoutePlan = zamel.RoutePlan;
 const Step = zamel.Step;
 const PolicyKind = @import("step.zig").PolicyKind;
 const ChoiceBranch = @import("step.zig").ChoiceBranch;
+const InMemoryStore = zamel.InMemoryStore;
+const http = @import("http.zig");
 
 fn testClock(_: ?*anyopaque) u64 {
     return 0;
@@ -1189,5 +1191,691 @@ test "predAnd in filter step" {
 
         // Body unchanged — processor never ran
         try std.testing.expectEqualStrings("hello world", ex.body);
+    }
+}
+
+// ======== Processor Factories (Phase 1) ========
+
+test "proc.setBody via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.setBody("replaced")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("original");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("replaced", ex.body);
+}
+
+test "proc.setHeader via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.setHeader("Content-Type", "text/plain")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("text/plain", ex.getHeader("Content-Type").?);
+}
+
+test "proc.removeHeader via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.removeHeader("temp")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.putHeader("temp", "value");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expect(ex.getHeader("temp") == null);
+}
+
+test "proc.transformBody via processor factory" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    const proc = try zamel.proc.transformBody(r.arena.allocator(), struct {
+        fn transform(body: []const u8, a: std.mem.Allocator) ![]u8 {
+            return try std.fmt.allocPrint(a, "[{s}]", .{body});
+        }
+    }.transform);
+    _ = try (try r.process(proc)).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("[hello]", ex.body);
+}
+
+test "processor factories in nested WhenBuilder" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var c = r.choice();
+    var w = c.when(try zamel.pred.headerEq(r.arena.allocator(), "type", "A"));
+    _ = try (try (try w.setBody("when-body")).process(Processor.fromFn(captureProcessor, null))).endWhen();
+    _ = try (try c.end()).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.putHeader("type", "A");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 1, &ex);
+
+    try std.testing.expectEqualStrings("when-body", captured());
+}
+
+// ======== Idempotent Consumer (Phase 2) ========
+
+fn testServicesWithStore(alloc: std.mem.Allocator, store: *InMemoryStore) Services {
+    return .{
+        .allocator = alloc,
+        .clock = .{ .nowMillisFn = testClock, .ctx = null },
+        .store = store.stateStore(),
+    };
+}
+
+test "idempotent consumer suppresses duplicates" {
+    const alloc = std.testing.allocator;
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+
+    const services = testServicesWithStore(alloc, &store);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var idem = r.idempotent("MessageId");
+    _ = try (try idem.process(Processor.fromFn(captureProcessor, null))).endIdempotent();
+    const rid = try r.build();
+
+    // First message
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("first");
+        try ex.putHeader("MessageId", "msg-001");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, rid, &ex);
+
+        try std.testing.expectEqualStrings("first", captured());
+    }
+
+    // Duplicate (same MessageId) — should NOT process
+    capture_len = 0;
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("duplicate");
+        try ex.putHeader("MessageId", "msg-001");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, rid, &ex);
+
+        // Capture should still be empty — processor was skipped
+        try std.testing.expectEqual(@as(usize, 0), capture_len);
+    }
+
+    // Different MessageId — should process
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("second");
+        try ex.putHeader("MessageId", "msg-002");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, rid, &ex);
+
+        try std.testing.expectEqualStrings("second", captured());
+    }
+}
+
+test "idempotent consumer returns error when key header missing" {
+    const alloc = std.testing.allocator;
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+
+    const services = testServicesWithStore(alloc, &store);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(captureProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .IdempotentConsumer = .{ .key_header = "MissingHeader", .route = inner_rid } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try std.testing.expectError(error.IdempotentKeyMissing, exec.run(&plan, main_rid, &ex));
+}
+
+test "idempotent consumer returns error when store missing" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc); // No store
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(captureProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .IdempotentConsumer = .{ .key_header = "Id", .route = inner_rid } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+    try ex.putHeader("Id", "1");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try std.testing.expectError(error.StateStoreRequired, exec.run(&plan, main_rid, &ex));
+}
+
+test "idempotent consumer via builder DSL" {
+    const alloc = std.testing.allocator;
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+
+    const services = testServicesWithStore(alloc, &store);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var idem = r.idempotent("Id");
+    _ = try (try idem.process(Processor.fromFn(captureProcessor, null))).endIdempotent();
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("data");
+    try ex.putHeader("Id", "unique");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("data", captured());
+}
+
+// ======== Content Enricher (Phase 3) ========
+
+fn enrichEndpointSend(_: ?*anyopaque, ex: *Exchange) !void {
+    try ex.setBody("enriched-data");
+}
+
+fn enrichEndpointCreate(_: ?*anyopaque, _: std.mem.Allocator) !zamel.Producer {
+    return .{ .ctx = null, .sendFn = enrichEndpointSend };
+}
+
+test "enrich replaces body with endpoint response" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    const enrich_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = enrichEndpointCreate,
+    };
+
+    var steps = [_]Step{.{ .Enrich = .{ .endpoint = .{ .endpoint = enrich_ep }, .merge = null } }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("original");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("enriched-data", ex.body);
+}
+
+fn mergeProcessor(_: ?*anyopaque, ex: *Exchange) !void {
+    // Merge: combine original + enriched
+    const original = ex.getHeader("CamelEnrichOriginalBody") orelse return;
+    const enriched = ex.body;
+    const merged = try std.fmt.allocPrint(ex.allocator, "{s}+{s}", .{ original, enriched });
+    if (enriched.len != 0) ex.allocator.free(ex.body);
+    ex.body = merged;
+}
+
+test "enrich with merge processor" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    const enrich_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = enrichEndpointCreate,
+    };
+
+    var steps = [_]Step{.{ .Enrich = .{
+        .endpoint = .{ .endpoint = enrich_ep },
+        .merge = Processor.fromFn(mergeProcessor, null),
+    } }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("original");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("original+enriched-data", ex.body);
+}
+
+test "enrich via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    const enrich_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = enrichEndpointCreate,
+    };
+
+    _ = try (try r.enrich(.{ .endpoint = enrich_ep }, null)).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("original");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("enriched-data", ex.body);
+}
+
+// ======== Direct Endpoint (Phase 4) ========
+
+test "direct endpoint routes to named route" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Register a named route that uppercases
+    var r1 = RtBuilder.init(alloc, &registry);
+    defer r1.deinit();
+
+    _ = try (try r1.process(Processor.fromFn(uppercaseProcessor, null))).build();
+    try registry.registerRoute("uppercase", &r1.plan, 0);
+
+    // Build main route that sends to direct:uppercase
+    var r2 = RtBuilder.init(alloc, &registry);
+    defer r2.deinit();
+
+    _ = try (try r2.toUri("direct:uppercase")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r2.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+test "direct endpoint returns error for unknown route" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.toUri("direct:nonexistent")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try std.testing.expectError(error.DirectRouteNotFound, exec.run(&r.plan, 0, &ex));
+}
+
+test "direct endpoint chaining" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Route A: uppercases
+    var r_a = RtBuilder.init(alloc, &registry);
+    defer r_a.deinit();
+    _ = try (try r_a.process(Processor.fromFn(uppercaseProcessor, null))).build();
+    try registry.registerRoute("step-a", &r_a.plan, 0);
+
+    // Route B: calls step-a then captures
+    var r_b = RtBuilder.init(alloc, &registry);
+    defer r_b.deinit();
+    _ = try (try (try r_b.toUri("direct:step-a")).process(Processor.fromFn(captureProcessor, null))).build();
+    try registry.registerRoute("step-b", &r_b.plan, 0);
+
+    // Main: calls step-b
+    var r_main = RtBuilder.init(alloc, &registry);
+    defer r_main.deinit();
+    _ = try (try r_main.toUri("direct:step-b")).build();
+
+    capture_len = 0;
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("chain test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r_main.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("CHAIN TEST", captured());
+}
+
+test "builder register method" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try r.process(Processor.fromFn(uppercaseProcessor, null));
+    try r.register("my-route");
+
+    // Route should be registered
+    const named = registry.lookupRoute("my-route");
+    try std.testing.expect(named != null);
+}
+
+// ======== SEDA Endpoint (Phase 5) ========
+
+test "seda queue isolation between names" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Resolve two different seda endpoints
+    const ep1 = try registry.resolve(alloc, "seda:queue1");
+    const ep2 = try registry.resolve(alloc, "seda:queue2");
+
+    // They should be different endpoints
+    const prod1 = try ep1.createProducer(alloc);
+    const prod2 = try ep2.createProducer(alloc);
+
+    var ex1 = Exchange.init(alloc);
+    defer ex1.deinit();
+    try ex1.setBody("msg-q1");
+    try prod1.send(&ex1);
+
+    var ex2 = Exchange.init(alloc);
+    defer ex2.deinit();
+    try ex2.setBody("msg-q2");
+    try prod2.send(&ex2);
+
+    // Queue1 should have 1 message
+    const q1 = registry.seda_queues.get("queue1").?;
+    try std.testing.expectEqual(@as(usize, 1), q1.len());
+
+    const q2 = registry.seda_queues.get("queue2").?;
+    try std.testing.expectEqual(@as(usize, 1), q2.len());
+}
+
+test "seda enqueue and drain via endpoint" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    const ep = try registry.resolve(alloc, "seda:test-queue");
+    const prod = try ep.createProducer(alloc);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("seda-msg");
+    try ex.putHeader("key", "val");
+
+    try prod.send(&ex);
+
+    const q = registry.seda_queues.get("test-queue").?;
+    try std.testing.expectEqual(@as(usize, 1), q.len());
+
+    const messages = try q.drain(alloc);
+    defer alloc.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("seda-msg", messages[0].body);
+
+    // Clean up drained messages
+    alloc.free(messages[0].body);
+    var hdr = messages[0].headers;
+    var hit = hdr.iterator();
+    while (hit.next()) |e| alloc.free(e.value_ptr.*);
+    hdr.deinit();
+}
+
+// ======== HTTP Endpoint (Phase 6) ========
+
+test "http endpoint resolution" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Should resolve without error
+    const ep = try registry.resolve(alloc, "http://127.0.0.1:8080/api");
+    _ = try ep.createProducer(alloc);
+}
+
+test "https endpoint resolution" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    const ep = try registry.resolve(alloc, "https://127.0.0.1:443/secure");
+    _ = try ep.createProducer(alloc);
+}
+
+test "http URL parsing" {
+    const p1 = http.parseHttpUrl("http://127.0.0.1:8080/api/test").?;
+    try std.testing.expectEqualStrings("127.0.0.1", p1.host);
+    try std.testing.expectEqual(@as(u16, 8080), p1.port);
+    try std.testing.expectEqualStrings("/api/test", p1.path);
+
+    const p2 = http.parseHttpUrl("https://10.0.0.1/").?;
+    try std.testing.expectEqual(@as(u16, 443), p2.port);
+
+    try std.testing.expect(http.parseHttpUrl("ftp://bad") == null);
+}
+
+// ======== Combined patterns ========
+
+test "setBody + setHeader + enrich combined pipeline" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    const enrich_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = enrichEndpointCreate,
+    };
+
+    _ = try (try (try (try r.setHeader("stage", "prepared")).setBody("initial")).enrich(.{ .endpoint = enrich_ep }, null)).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    // After enrich, body should be enriched-data
+    try std.testing.expectEqualStrings("enriched-data", ex.body);
+    try std.testing.expectEqualStrings("prepared", ex.getHeader("stage").?);
+}
+
+test "idempotent + direct combined" {
+    const alloc = std.testing.allocator;
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+
+    const services = testServicesWithStore(alloc, &store);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Register a direct route that uppercases
+    var r_direct = RtBuilder.init(alloc, &registry);
+    defer r_direct.deinit();
+    _ = try (try r_direct.process(Processor.fromFn(uppercaseProcessor, null))).build();
+    try registry.registerRoute("upper", &r_direct.plan, 0);
+
+    // Main route: idempotent then send to direct:upper
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var idem = r.idempotent("Id");
+    _ = try (try idem.toUri("direct:upper")).endIdempotent();
+    const rid = try r.build();
+
+    // First call
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hello");
+        try ex.putHeader("Id", "unique-1");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, rid, &ex);
+
+        try std.testing.expectEqualStrings("HELLO", ex.body);
+    }
+
+    // Duplicate — should be skipped (body unchanged)
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hello again");
+        try ex.putHeader("Id", "unique-1");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, rid, &ex);
+
+        // Body stays as "hello again" — not uppercased
+        try std.testing.expectEqualStrings("hello again", ex.body);
     }
 }

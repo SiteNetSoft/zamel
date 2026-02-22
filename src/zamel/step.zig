@@ -54,6 +54,18 @@ pub const Step = union(enum) {
         interval_ms: u32,
     },
 
+    // Idempotent consumer: dedup by header key via StateStore
+    IdempotentConsumer: struct {
+        key_header: []const u8,
+        route: RouteId,
+    },
+
+    // Content enricher: call endpoint, optionally merge result
+    Enrich: struct {
+        endpoint: EndpointRef,
+        merge: ?Processor = null,
+    },
+
     // Policies (wrapper around a child route):
     Policy: struct {
         kind: PolicyKind,

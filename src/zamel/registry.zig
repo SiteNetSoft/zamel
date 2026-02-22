@@ -9,15 +9,24 @@ const Exchange = @import("exchange.zig").Exchange;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const SyncExecutor = @import("executor_sync.zig").SyncExecutor;
 const Services = @import("services.zig").Services;
+const direct = @import("direct.zig");
+const seda = @import("seda.zig");
 
 pub const EndpointFactory = *const fn (allocator: std.mem.Allocator, rest: []const u8) anyerror!Endpoint;
 pub const ConsumerFactory = *const fn (allocator: std.mem.Allocator, rest: []const u8) anyerror!Consumer;
+
+pub const NamedRoute = struct {
+    plan: *const RoutePlan,
+    route_id: u32,
+};
 
 pub const Registry = struct {
     services: Services,
     cache: std.StringHashMap(Endpoint),
     endpoint_factories: std.StringHashMap(EndpointFactory),
     consumer_factories: std.StringHashMap(ConsumerFactory),
+    named_routes: std.StringHashMap(NamedRoute),
+    seda_queues: std.StringHashMap(*seda.SedaQueue),
 
     pub fn init(services: Services) Registry {
         return .{
@@ -25,6 +34,8 @@ pub const Registry = struct {
             .cache = std.StringHashMap(Endpoint).init(services.allocator),
             .endpoint_factories = std.StringHashMap(EndpointFactory).init(services.allocator),
             .consumer_factories = std.StringHashMap(ConsumerFactory).init(services.allocator),
+            .named_routes = std.StringHashMap(NamedRoute).init(services.allocator),
+            .seda_queues = std.StringHashMap(*seda.SedaQueue).init(services.allocator),
         };
     }
 
@@ -38,6 +49,15 @@ pub const Registry = struct {
         self.cache.deinit();
         self.endpoint_factories.deinit();
         self.consumer_factories.deinit();
+        self.named_routes.deinit();
+
+        // Clean up seda queues
+        var sq_it = self.seda_queues.iterator();
+        while (sq_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.services.allocator.destroy(entry.value_ptr.*);
+        }
+        self.seda_queues.deinit();
     }
 
     /// Register a custom endpoint scheme.
@@ -48,6 +68,20 @@ pub const Registry = struct {
     /// Register a custom consumer (source) scheme.
     pub fn registerConsumer(self: *Registry, scheme: []const u8, factory: ConsumerFactory) !void {
         try self.consumer_factories.put(scheme, factory);
+    }
+
+    pub fn registerRoute(self: *Registry, name: []const u8, plan: *const RoutePlan, route_id: u32) !void {
+        try self.named_routes.put(name, .{ .plan = plan, .route_id = route_id });
+    }
+
+    pub fn lookupRoute(self: *Registry, name: []const u8) ?NamedRoute {
+        return self.named_routes.get(name);
+    }
+
+    pub fn getOrCreateSedaQueue(self: *Registry) !*seda.SedaQueue {
+        const q = try self.services.allocator.create(seda.SedaQueue);
+        q.* = seda.SedaQueue.init(self.services.allocator);
+        return q;
     }
 
     pub fn resolve(self: *Registry, allocator: std.mem.Allocator, uri: []const u8) !Endpoint {
@@ -61,6 +95,12 @@ pub const Registry = struct {
             try makeLogEndpoint(alloc, parsed.rest)
         else if (std.mem.eql(u8, parsed.scheme, "file"))
             try makeFileEndpoint(alloc, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "direct"))
+            try direct.makeDirectEndpoint(alloc, parsed.rest, self)
+        else if (std.mem.eql(u8, parsed.scheme, "seda"))
+            try self.resolveSedaEndpoint(alloc, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https"))
+            try @import("http.zig").makeHttpEndpoint(alloc, uri)
         else if (self.endpoint_factories.get(parsed.scheme)) |factory|
             try factory(alloc, parsed.rest)
         else
@@ -69,6 +109,16 @@ pub const Registry = struct {
         const key = try alloc.dupe(u8, uri);
         try self.cache.put(key, ep);
         return ep;
+    }
+
+    fn resolveSedaEndpoint(self: *Registry, allocator: std.mem.Allocator, name: []const u8) !Endpoint {
+        const gop = try self.seda_queues.getOrPut(name);
+        if (!gop.found_existing) {
+            const q = try allocator.create(seda.SedaQueue);
+            q.* = seda.SedaQueue.init(allocator);
+            gop.value_ptr.* = q;
+        }
+        return try seda.makeSedaEndpoint(allocator, gop.value_ptr.*);
     }
 
     /// Resolves a source URI to a Consumer.
@@ -80,6 +130,18 @@ pub const Registry = struct {
         }
         if (std.mem.eql(u8, parsed.scheme, "file")) {
             return try consumers.fileReader(allocator, parsed.rest);
+        }
+        if (std.mem.eql(u8, parsed.scheme, "direct")) {
+            return try direct.makeDirectConsumer(allocator, parsed.rest, self);
+        }
+        if (std.mem.eql(u8, parsed.scheme, "seda")) {
+            const gop = try self.seda_queues.getOrPut(parsed.rest);
+            if (!gop.found_existing) {
+                const q = try allocator.create(seda.SedaQueue);
+                q.* = seda.SedaQueue.init(allocator);
+                gop.value_ptr.* = q;
+            }
+            return try seda.makeSedaConsumer(allocator, gop.value_ptr.*, self);
         }
         if (self.consumer_factories.get(parsed.scheme)) |factory| {
             return try factory(allocator, parsed.rest);
