@@ -7,6 +7,8 @@ const RtBuilder = zamel.RtBuilder;
 const Processor = zamel.Processor;
 const Predicate = zamel.Predicate;
 const Splitter = zamel.Splitter;
+const RecipientResolver = zamel.RecipientResolver;
+const EndpointRef = zamel.EndpointRef;
 const SyncExecutor = zamel.SyncExecutor;
 const RoutePlan = zamel.RoutePlan;
 const Step = zamel.Step;
@@ -187,7 +189,7 @@ test "builder + executor: retry wraps inner steps" {
 
     capture_len = 0;
 
-    var pol = r.retry(3, 0);
+    var pol = try r.retry(3, 0);
     _ = try (try pol.process(Processor.fromFn(uppercaseProcessor, null))).endPolicy();
 
     const rid = try r.build();
@@ -768,7 +770,7 @@ test "builder + executor: timeout via DSL" {
     var r = RtBuilder.init(alloc, &registry);
     defer r.deinit();
 
-    var pol = r.timeout(99999);
+    var pol = try r.timeout(99999);
     _ = try (try pol.process(Processor.fromFn(uppercaseProcessor, null))).endPolicy();
 
     const rid = try r.build();
@@ -828,7 +830,7 @@ test "builder + executor: circuitBreaker via DSL" {
     var r = RtBuilder.init(alloc, &registry);
     defer r.deinit();
 
-    var pol = r.circuitBreaker(1, 50000);
+    var pol = try r.circuitBreaker(1, 50000);
     _ = try (try pol.process(Processor.fromFn(alwaysFailProcessor, null))).endPolicy();
 
     const rid = try r.build();
@@ -877,4 +879,315 @@ test "builder: splitSequence via DSL" {
     try exec.run(&r.plan, rid, &ex);
 
     try std.testing.expectEqualStrings("c", captured());
+}
+
+// -------- wire tap tests --------
+
+test "wire tap sends copy without affecting main route" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    dl_captured_len = 0;
+    capture_len = 0;
+
+    const tap_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    // Wire tap then uppercase
+    _ = try (try (try r.wireTap(.{ .endpoint = tap_ep })).process(
+        Processor.fromFn(uppercaseProcessor, null),
+    )).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    // Tap should have received original body
+    try std.testing.expectEqualStrings("hello", dl_captured_body[0..dl_captured_len]);
+    // Main route should have uppercased
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+test "wire tap error does not affect main route" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Tap endpoint that always fails
+    const bad_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = struct {
+            fn create(_: ?*anyopaque, _: std.mem.Allocator) !zamel.Producer {
+                return .{ .ctx = null, .sendFn = struct {
+                    fn send(_: ?*anyopaque, _: *Exchange) !void {
+                        return error.TapFailed;
+                    }
+                }.send };
+            }
+        }.create,
+    };
+
+    var steps = [_]Step{
+        .{ .WireTap = .{ .endpoint = bad_ep } },
+        .{ .Process = Processor.fromFn(uppercaseProcessor, null) },
+    };
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, rid, &ex);
+
+    // Main route should still succeed despite tap failure
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// -------- recipient list tests --------
+
+fn testRecipientResolver(_: ?*anyopaque, _: *Exchange, out: *std.ArrayList(EndpointRef), allocator: std.mem.Allocator) !void {
+    const ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+    try out.append(allocator, .{ .endpoint = ep });
+}
+
+test "recipient list routes to dynamically resolved endpoints" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    dl_captured_len = 0;
+
+    var steps = [_]Step{
+        .{ .RecipientList = .{ .resolver = RecipientResolver.fromFn(testRecipientResolver, null) } },
+    };
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("routed msg");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("routed msg", dl_captured_body[0..dl_captured_len]);
+}
+
+test "builder: recipientList via DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    dl_captured_len = 0;
+
+    _ = try (try r.recipientList(RecipientResolver.fromFn(testRecipientResolver, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("dsl recipient");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("dsl recipient", dl_captured_body[0..dl_captured_len]);
+}
+
+// -------- throttle tests --------
+
+test "throttle step with zero delay succeeds" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{
+        .{ .Throttle = .{ .interval_ms = 0 } },
+        .{ .Process = Processor.fromFn(uppercaseProcessor, null) },
+    };
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("throttled");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("THROTTLED", ex.body);
+}
+
+test "builder: throttle via DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.throttle(0)).process(
+        Processor.fromFn(uppercaseProcessor, null),
+    )).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("TEST", ex.body);
+}
+
+// -------- policy validation tests --------
+
+test "retry rejects max=0" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    try std.testing.expectError(error.InvalidPolicyConfig, r.retry(0, 100));
+}
+
+test "timeout rejects ms=0" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    try std.testing.expectError(error.InvalidPolicyConfig, r.timeout(0));
+}
+
+test "circuitBreaker rejects threshold=0" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    try std.testing.expectError(error.InvalidPolicyConfig, r.circuitBreaker(0, 1000));
+}
+
+// -------- predicate combinator integration tests --------
+
+test "predNot with choice routing" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    const not_a = try zamel.pred.predNot(r.arena.allocator(), try zamel.pred.headerEq(r.arena.allocator(), "type", "A"));
+
+    var c = r.choice();
+    var w1 = c.when(not_a);
+    _ = try (try w1.process(Processor.fromFn(captureProcessor, null))).endWhen();
+    _ = try (try c.end()).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("not-A message");
+    try ex.putHeader("type", "B");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 1, &ex);
+
+    try std.testing.expectEqualStrings("not-A message", captured());
+}
+
+test "predAnd in filter step" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    const has_type_a = try zamel.pred.headerEq(r.arena.allocator(), "type", "A");
+    const has_hello = try zamel.pred.bodyContains(r.arena.allocator(), "hello");
+    const both = try zamel.pred.predAnd(r.arena.allocator(), has_type_a, has_hello);
+
+    _ = try (try (try r.filter(both)).process(
+        Processor.fromFn(uppercaseProcessor, null),
+    )).build();
+
+    // Matches both predicates
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hello world");
+        try ex.putHeader("type", "A");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, 0, &ex);
+
+        try std.testing.expectEqualStrings("HELLO WORLD", ex.body);
+    }
+
+    // Fails one predicate — filter stops route
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hello world");
+        try ex.putHeader("type", "B");
+
+        var exec = SyncExecutor.init(services);
+        defer exec.deinit();
+        try exec.run(&r.plan, 0, &ex);
+
+        // Body unchanged — processor never ran
+        try std.testing.expectEqualStrings("hello world", ex.body);
+    }
 }

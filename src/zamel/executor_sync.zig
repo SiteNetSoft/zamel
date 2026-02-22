@@ -5,6 +5,7 @@ const RoutePlan = @import("plan.zig").RoutePlan;
 const Step = @import("step.zig").Step;
 const PolicyKind = @import("step.zig").PolicyKind;
 const RouteId = @import("step.zig").RouteId;
+const EndpointRef = @import("endpoint.zig").EndpointRef;
 
 const CircuitState = struct {
     failures: u32 = 0,
@@ -122,6 +123,27 @@ pub const SyncExecutor = struct {
                     ex.body = joined;
                 },
 
+                .WireTap => |eref| {
+                    // Fire-and-forget: copy exchange, send to tap, ignore errors
+                    var copy = Exchange.init(ex.allocator);
+                    defer copy.deinit();
+                    try copy.setBody(ex.body);
+                    var hit = ex.headers.iterator();
+                    while (hit.next()) |e| try copy.putHeader(e.key_ptr.*, e.value_ptr.*);
+                    self.sendTo(eref, &copy) catch {};
+                },
+
+                .RecipientList => |rl| {
+                    var recipients: std.ArrayList(EndpointRef) = .empty;
+                    defer recipients.deinit(ex.allocator);
+                    try rl.resolver.call(ex, &recipients, ex.allocator);
+                    for (recipients.items) |eref| try self.sendTo(eref, ex);
+                },
+
+                .Throttle => |t| {
+                    @import("time_util.zig").sleepMs(@as(u64, t.interval_ms));
+                },
+
                 .Policy => |pol| {
                     switch (pol.kind) {
                         .Retry => |retry| {
@@ -184,7 +206,7 @@ pub const SyncExecutor = struct {
         }
     }
 
-    fn sendTo(self: *SyncExecutor, eref: anytype, ex: *Exchange) !void {
+    fn sendTo(self: *SyncExecutor, eref: EndpointRef, ex: *Exchange) !void {
         _ = self;
         switch (eref) {
             .endpoint => |ep| {

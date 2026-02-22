@@ -231,18 +231,18 @@ fn fileSend(ctx: ?*anyopaque, ex: *Exchange) !void {
     const fd = try posix.openat(posix.AT.FDCWD, c.path, flags, 0o644);
     defer posix.close(fd);
 
-    writeAll(fd, ex.body);
-    if (c.append) writeAll(fd, "\n");
+    try writeAll(fd, ex.body);
+    if (c.append) try writeAll(fd, "\n");
 }
 
-fn writeAll(fd: posix.fd_t, data: []const u8) void {
+fn writeAll(fd: posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
         const rc = posix.system.write(fd, data.ptr + written, data.len - written);
         switch (posix.errno(rc)) {
             .SUCCESS => written += rc,
             .INTR => continue,
-            else => return,
+            else => return error.WriteFailed,
         }
     }
 }

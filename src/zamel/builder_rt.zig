@@ -9,6 +9,7 @@ const RouteId = @import("step.zig").RouteId;
 const Predicate = @import("predicate.zig").Predicate;
 const Processor = @import("processor.zig").Processor;
 const Splitter = @import("splitter.zig").Splitter;
+const RecipientResolver = @import("recipient_resolver.zig").RecipientResolver;
 const Endpoint = @import("endpoint.zig").Endpoint;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 
@@ -87,6 +88,32 @@ pub const RtBuilder = struct {
         return MulticastBuilder.init(self);
     }
 
+    // ---- wire tap ----
+
+    pub fn wireTap(self: *RtBuilder, ep: EndpointRef) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .WireTap = ep });
+        return self;
+    }
+
+    pub fn wireTapUri(self: *RtBuilder, uri: []const u8) !*RtBuilder {
+        const ep = try self.registry.resolve(self.arena.allocator(), uri);
+        return try self.wireTap(.{ .endpoint = ep });
+    }
+
+    // ---- recipient list ----
+
+    pub fn recipientList(self: *RtBuilder, resolver: RecipientResolver) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .RecipientList = .{ .resolver = resolver } });
+        return self;
+    }
+
+    // ---- throttle ----
+
+    pub fn throttle(self: *RtBuilder, interval_ms: u32) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Throttle = .{ .interval_ms = interval_ms } });
+        return self;
+    }
+
     // ---- split / aggregate DSL ----
 
     pub fn split(self: *RtBuilder, delimiter: u8) SplitBuilder {
@@ -111,11 +138,13 @@ pub const RtBuilder = struct {
 
     // ---- policy DSL ----
 
-    pub fn retry(self: *RtBuilder, max: u32, backoff_ms: u32) PolicyBuilder {
+    pub fn retry(self: *RtBuilder, max: u32, backoff_ms: u32) !PolicyBuilder {
+        if (max == 0) return error.InvalidPolicyConfig;
         return PolicyBuilder.init(self, .{ .Retry = .{ .max = max, .backoff_ms = backoff_ms } });
     }
 
-    pub fn timeout(self: *RtBuilder, ms: u32) PolicyBuilder {
+    pub fn timeout(self: *RtBuilder, ms: u32) !PolicyBuilder {
+        if (ms == 0) return error.InvalidPolicyConfig;
         return PolicyBuilder.init(self, .{ .Timeout = .{ .ms = ms } });
     }
 
@@ -128,7 +157,8 @@ pub const RtBuilder = struct {
         return PolicyBuilder.init(self, .{ .DeadLetter = .{ .endpoint = .{ .endpoint = ep } } });
     }
 
-    pub fn circuitBreaker(self: *RtBuilder, failure_threshold: u32, reset_ms: u32) PolicyBuilder {
+    pub fn circuitBreaker(self: *RtBuilder, failure_threshold: u32, reset_ms: u32) !PolicyBuilder {
+        if (failure_threshold == 0) return error.InvalidPolicyConfig;
         return PolicyBuilder.init(self, .{ .CircuitBreaker = .{ .failure_threshold = failure_threshold, .reset_ms = reset_ms } });
     }
 

@@ -3,6 +3,7 @@ const Predicate = @import("predicate.zig").Predicate;
 const Processor = @import("processor.zig").Processor;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 const Splitter = @import("splitter.zig").Splitter;
+const RecipientResolver = @import("recipient_resolver.zig").RecipientResolver;
 
 pub const RouteId = u32;
 
@@ -38,6 +39,19 @@ pub const Step = union(enum) {
     Aggregate: struct {
         separator: []const u8 = "\n",
         route: RouteId,
+    },
+
+    // Fire-and-forget copy to a side endpoint:
+    WireTap: EndpointRef,
+
+    // Dynamic routing to endpoints resolved at runtime:
+    RecipientList: struct {
+        resolver: RecipientResolver,
+    },
+
+    // Rate limiting: introduces a delay between messages:
+    Throttle: struct {
+        interval_ms: u32,
     },
 
     // Policies (wrapper around a child route):

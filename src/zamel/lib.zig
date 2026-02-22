@@ -2,6 +2,7 @@ pub const Exchange = @import("exchange.zig").Exchange;
 pub const Predicate = @import("predicate.zig").Predicate;
 pub const Processor = @import("processor.zig").Processor;
 pub const Splitter = @import("splitter.zig").Splitter;
+pub const RecipientResolver = @import("recipient_resolver.zig").RecipientResolver;
 
 pub const Consumer = @import("consumer.zig").Consumer;
 pub const Endpoint = @import("endpoint.zig").Endpoint;

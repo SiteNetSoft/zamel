@@ -98,7 +98,7 @@ fn fileReaderStart(ctx: ?*anyopaque, allocator: std.mem.Allocator, services: Ser
                 try content_list.appendSlice(allocator, read_buf[0..rc]);
             },
             .INTR => continue,
-            else => break,
+            else => return error.ReadFailed,
         }
     }
     const content = content_list.items;
