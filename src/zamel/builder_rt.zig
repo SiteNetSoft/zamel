@@ -5,6 +5,8 @@ const PolicyKind = @import("step.zig").PolicyKind;
 const SplitKind = @import("step.zig").SplitKind;
 const DataFormat = @import("step.zig").DataFormat;
 const ClaimCheckAction = @import("step.zig").ClaimCheckAction;
+const LogLevel = @import("step.zig").LogLevel;
+const LoadBalancerStrategy = @import("step.zig").LoadBalancerStrategy;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const RouteId = @import("step.zig").RouteId;
 
@@ -233,6 +235,45 @@ pub const RtBuilder = struct {
         return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
+    // ---- delay ----
+
+    pub fn delay(self: *RtBuilder, ms: u32) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    // ---- log ----
+
+    pub fn log(self: *RtBuilder, message: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *RtBuilder, level: LogLevel, message: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    // ---- routing slip ----
+
+    pub fn routingSlip(self: *RtBuilder, header: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    // ---- transform ----
+
+    pub fn transform(self: *RtBuilder, p: Processor) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Transform = p });
+        return self;
+    }
+
+    // ---- load balancer DSL ----
+
+    pub fn loadBalancer(self: *RtBuilder, strategy: LoadBalancerStrategy) LoadBalancerBuilder {
+        return LoadBalancerBuilder.init(self, strategy);
+    }
+
     // ---- finalize ----
 
     pub fn build(self: *RtBuilder) !RouteId {
@@ -366,6 +407,31 @@ pub const WhenBuilder = struct {
         return self;
     }
 
+    pub fn delay(self: *WhenBuilder, ms: u32) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *WhenBuilder, message: []const u8) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *WhenBuilder, level: LogLevel, message: []const u8) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *WhenBuilder, header: []const u8) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *WhenBuilder, p: Processor) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
     pub fn endWhen(self: *WhenBuilder) !*ChoiceBuilder {
         const a = self.alloc();
         const rid = try self.choice.parent.plan.addRoute(a, self.steps.items);
@@ -448,6 +514,31 @@ pub const OtherwiseBuilder = struct {
 
     pub fn claimCheckRetrieve(self: *OtherwiseBuilder, key: []const u8) !*OtherwiseBuilder {
         try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
+    pub fn delay(self: *OtherwiseBuilder, ms: u32) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *OtherwiseBuilder, message: []const u8) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *OtherwiseBuilder, level: LogLevel, message: []const u8) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *OtherwiseBuilder, header: []const u8) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *OtherwiseBuilder, p: Processor) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
         return self;
     }
 
@@ -534,6 +625,31 @@ pub const PolicyBuilder = struct {
 
     pub fn claimCheckRetrieve(self: *PolicyBuilder, key: []const u8) !*PolicyBuilder {
         try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
+    pub fn delay(self: *PolicyBuilder, ms: u32) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *PolicyBuilder, message: []const u8) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *PolicyBuilder, level: LogLevel, message: []const u8) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *PolicyBuilder, header: []const u8) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *PolicyBuilder, p: Processor) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
         return self;
     }
 
@@ -626,6 +742,31 @@ pub const SplitBuilder = struct {
         return self;
     }
 
+    pub fn delay(self: *SplitBuilder, ms: u32) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *SplitBuilder, message: []const u8) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *SplitBuilder, level: LogLevel, message: []const u8) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *SplitBuilder, header: []const u8) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *SplitBuilder, p: Processor) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
     pub fn endSplit(self: *SplitBuilder) !*RtBuilder {
         const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.parent.cur_steps.append(self.alloc(), .{ .Split = .{
@@ -712,6 +853,31 @@ pub const AggregateBuilder = struct {
 
     pub fn claimCheckRetrieve(self: *AggregateBuilder, key: []const u8) !*AggregateBuilder {
         try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
+    pub fn delay(self: *AggregateBuilder, ms: u32) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *AggregateBuilder, message: []const u8) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *AggregateBuilder, level: LogLevel, message: []const u8) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *AggregateBuilder, header: []const u8) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *AggregateBuilder, p: Processor) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
         return self;
     }
 
@@ -829,6 +995,31 @@ pub const MulticastBranchBuilder = struct {
         return self;
     }
 
+    pub fn delay(self: *MulticastBranchBuilder, ms: u32) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *MulticastBranchBuilder, message: []const u8) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *MulticastBranchBuilder, level: LogLevel, message: []const u8) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *MulticastBranchBuilder, header: []const u8) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *MulticastBranchBuilder, p: Processor) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
     pub fn endBranch(self: *MulticastBranchBuilder) !*MulticastBuilder {
         const rid = try self.mc.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.mc.routes.append(self.alloc(), rid);
@@ -905,6 +1096,31 @@ pub const IdempotentBuilder = struct {
         return self;
     }
 
+    pub fn delay(self: *IdempotentBuilder, ms: u32) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *IdempotentBuilder, message: []const u8) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *IdempotentBuilder, level: LogLevel, message: []const u8) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *IdempotentBuilder, header: []const u8) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *IdempotentBuilder, p: Processor) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
     pub fn endIdempotent(self: *IdempotentBuilder) !*RtBuilder {
         const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.parent.cur_steps.append(self.alloc(), .{ .IdempotentConsumer = .{
@@ -960,6 +1176,31 @@ pub const DoTryBuilder = struct {
 
     pub fn removeHeader(self: *DoTryBuilder, key: []const u8) !*DoTryBuilder {
         return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn delay(self: *DoTryBuilder, ms: u32) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *DoTryBuilder, message: []const u8) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *DoTryBuilder, level: LogLevel, message: []const u8) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *DoTryBuilder, header: []const u8) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *DoTryBuilder, p: Processor) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
     }
 
     pub fn doCatch(self: *DoTryBuilder) DoCatchBuilder {
@@ -1037,6 +1278,31 @@ pub const DoCatchBuilder = struct {
         return try self.process(try processors.removeHeader(self.alloc(), key));
     }
 
+    pub fn delay(self: *DoCatchBuilder, ms: u32) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *DoCatchBuilder, message: []const u8) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *DoCatchBuilder, level: LogLevel, message: []const u8) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *DoCatchBuilder, header: []const u8) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *DoCatchBuilder, p: Processor) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
     pub fn doFinally(self: *DoCatchBuilder) DoFinallyBuilder {
         return DoFinallyBuilder.init(self.try_builder, self.steps.items);
     }
@@ -1095,7 +1361,136 @@ pub const DoFinallyBuilder = struct {
         return try self.process(try processors.removeHeader(self.alloc(), key));
     }
 
+    pub fn delay(self: *DoFinallyBuilder, ms: u32) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *DoFinallyBuilder, message: []const u8) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *DoFinallyBuilder, level: LogLevel, message: []const u8) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn routingSlip(self: *DoFinallyBuilder, header: []const u8) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    pub fn transform(self: *DoFinallyBuilder, p: Processor) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
     pub fn endDoTry(self: *DoFinallyBuilder) !*RtBuilder {
         return self.try_builder.finalize(self.catch_steps, self.steps.items);
+    }
+};
+
+pub const LoadBalancerBuilder = struct {
+    parent: *RtBuilder,
+    strategy: LoadBalancerStrategy,
+    routes: std.ArrayList(RouteId),
+
+    pub fn init(parent: *RtBuilder, strategy: LoadBalancerStrategy) LoadBalancerBuilder {
+        return .{
+            .parent = parent,
+            .strategy = strategy,
+            .routes = .empty,
+        };
+    }
+
+    fn alloc(self: *LoadBalancerBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn branch(self: *LoadBalancerBuilder) LoadBalancerBranchBuilder {
+        return LoadBalancerBranchBuilder.init(self);
+    }
+
+    pub fn endLoadBalancer(self: *LoadBalancerBuilder) !*RtBuilder {
+        try self.parent.cur_steps.append(self.alloc(), .{ .LoadBalancer = .{
+            .strategy = self.strategy,
+            .routes = self.routes.items,
+        } });
+        return self.parent;
+    }
+};
+
+pub const LoadBalancerBranchBuilder = struct {
+    lb: *LoadBalancerBuilder,
+    steps: std.ArrayList(Step),
+
+    pub fn init(lb: *LoadBalancerBuilder) LoadBalancerBranchBuilder {
+        return .{
+            .lb = lb,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *LoadBalancerBranchBuilder) std.mem.Allocator {
+        return self.lb.alloc();
+    }
+
+    pub fn process(self: *LoadBalancerBranchBuilder, p: Processor) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *LoadBalancerBranchBuilder, pred: Predicate) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *LoadBalancerBranchBuilder, ep: EndpointRef) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *LoadBalancerBranchBuilder, uri: []const u8) !*LoadBalancerBranchBuilder {
+        const ep = try self.lb.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *LoadBalancerBranchBuilder, value: []const u8) !*LoadBalancerBranchBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *LoadBalancerBranchBuilder, key: []const u8, value: []const u8) !*LoadBalancerBranchBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *LoadBalancerBranchBuilder, key: []const u8) !*LoadBalancerBranchBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn delay(self: *LoadBalancerBranchBuilder, ms: u32) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn log(self: *LoadBalancerBranchBuilder, message: []const u8) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn logAt(self: *LoadBalancerBranchBuilder, level: LogLevel, message: []const u8) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message, .level = level } });
+        return self;
+    }
+
+    pub fn transform(self: *LoadBalancerBranchBuilder, p: Processor) !*LoadBalancerBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
+    pub fn endBranch(self: *LoadBalancerBranchBuilder) !*LoadBalancerBuilder {
+        const rid = try self.lb.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.lb.routes.append(self.alloc(), rid);
+        return self.lb;
     }
 };

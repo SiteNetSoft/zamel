@@ -37,6 +37,72 @@ fn bodyContainsCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
     return std.mem.indexOf(u8, ex.body, c.needle) != null;
 }
 
+/// Predicate: header exists (any value)
+pub fn headerExists(allocator: std.mem.Allocator, key: []const u8) !Predicate {
+    const Ctx = struct { key: []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .key = key };
+    return Predicate.fromFn(headerExistsCall, p);
+}
+
+fn headerExistsCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { key: []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    return ex.getHeader(c.key) != null;
+}
+
+/// Predicate: body is empty (length == 0)
+pub fn bodyEmpty(_: std.mem.Allocator) !Predicate {
+    return Predicate.fromFn(bodyEmptyCall, null);
+}
+
+fn bodyEmptyCall(_: ?*anyopaque, ex: *Exchange) !bool {
+    return ex.body.len == 0;
+}
+
+/// Predicate: body starts with prefix
+pub fn bodyStartsWith(allocator: std.mem.Allocator, prefix: []const u8) !Predicate {
+    const Ctx = struct { prefix: []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .prefix = prefix };
+    return Predicate.fromFn(bodyStartsWithCall, p);
+}
+
+fn bodyStartsWithCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { prefix: []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    return std.mem.startsWith(u8, ex.body, c.prefix);
+}
+
+/// Predicate: body ends with suffix
+pub fn bodyEndsWith(allocator: std.mem.Allocator, suffix: []const u8) !Predicate {
+    const Ctx = struct { suffix: []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .suffix = suffix };
+    return Predicate.fromFn(bodyEndsWithCall, p);
+}
+
+fn bodyEndsWithCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { suffix: []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    return std.mem.endsWith(u8, ex.body, c.suffix);
+}
+
+/// Predicate: header value contains needle substring
+pub fn headerContains(allocator: std.mem.Allocator, key: []const u8, needle: []const u8) !Predicate {
+    const Ctx = struct { key: []const u8, needle: []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .key = key, .needle = needle };
+    return Predicate.fromFn(headerContainsCall, p);
+}
+
+fn headerContainsCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { key: []const u8, needle: []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    const val = ex.getHeader(c.key) orelse return false;
+    return std.mem.indexOf(u8, val, c.needle) != null;
+}
+
 // -------- combinators --------
 
 /// Predicate: NOT inner
@@ -201,4 +267,86 @@ test "predOr short-circuits on true" {
     // Neither matches
     try ex.putHeader("type", "Z");
     try std.testing.expect(!(try either.call(&ex)));
+}
+
+test "headerExists returns true when present, false when absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("X-Token", "abc");
+
+    const pred = try headerExists(alloc, "X-Token");
+    try std.testing.expect(try pred.call(&ex));
+
+    const pred2 = try headerExists(alloc, "Missing");
+    try std.testing.expect(!(try pred2.call(&ex)));
+}
+
+test "bodyEmpty returns true for empty body, false otherwise" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+
+    const pred = try bodyEmpty(alloc);
+    try std.testing.expect(try pred.call(&ex));
+
+    try ex.setBody("data");
+    try std.testing.expect(!(try pred.call(&ex)));
+}
+
+test "bodyStartsWith matches prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.setBody("hello world");
+
+    const pred = try bodyStartsWith(alloc, "hello");
+    try std.testing.expect(try pred.call(&ex));
+
+    const pred2 = try bodyStartsWith(alloc, "world");
+    try std.testing.expect(!(try pred2.call(&ex)));
+}
+
+test "bodyEndsWith matches suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.setBody("hello world");
+
+    const pred = try bodyEndsWith(alloc, "world");
+    try std.testing.expect(try pred.call(&ex));
+
+    const pred2 = try bodyEndsWith(alloc, "hello");
+    try std.testing.expect(!(try pred2.call(&ex)));
+}
+
+test "headerContains matches substring in header value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("Content-Type", "application/json");
+
+    const pred = try headerContains(alloc, "Content-Type", "json");
+    try std.testing.expect(try pred.call(&ex));
+
+    const pred2 = try headerContains(alloc, "Content-Type", "xml");
+    try std.testing.expect(!(try pred2.call(&ex)));
+
+    const pred3 = try headerContains(alloc, "Missing", "any");
+    try std.testing.expect(!(try pred3.call(&ex)));
 }

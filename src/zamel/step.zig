@@ -88,6 +88,29 @@ pub const Step = union(enum) {
         action: ClaimCheckAction,
         key: []const u8,
     },
+
+    // Delay: sleep for a specified number of milliseconds
+    Delay: struct { ms: u32 },
+
+    // Log: log a message template with interpolation
+    Log: struct {
+        message: []const u8,
+        level: LogLevel = .info,
+    },
+
+    // Routing slip: route through URIs listed in a header
+    RoutingSlip: struct {
+        header: []const u8,
+    },
+
+    // Load balancer: distribute exchanges across multiple routes
+    LoadBalancer: struct {
+        strategy: LoadBalancerStrategy,
+        routes: []const RouteId,
+    },
+
+    // Transform: like Process but semantically indicates body transformation
+    Transform: Processor,
 };
 
 pub const SplitKind = union(enum) {
@@ -99,6 +122,10 @@ pub const SplitKind = union(enum) {
 pub const DataFormat = enum { json };
 
 pub const ClaimCheckAction = enum { store, retrieve };
+
+pub const LogLevel = enum { debug, info, warn, err };
+
+pub const LoadBalancerStrategy = enum { round_robin, random };
 
 pub const PolicyKind = union(enum) {
     Retry: struct { max: u32, backoff_ms: u32 = 0 },

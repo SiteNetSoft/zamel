@@ -8,6 +8,7 @@ const RouteId = @import("step.zig").RouteId;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 const marshal = @import("marshal.zig");
 const Metrics = @import("metrics.zig").Metrics;
+const Registry = @import("registry.zig").Registry;
 
 const CircuitState = struct {
     failures: u32 = 0,
@@ -17,16 +18,20 @@ const CircuitState = struct {
 pub const SyncExecutor = struct {
     services: Services,
     circuit_states: std.AutoHashMap(RouteId, CircuitState),
+    lb_counters: std.AutoHashMap(usize, usize),
+    registry: ?*Registry = null,
 
     pub fn init(services: Services) SyncExecutor {
         return .{
             .services = services,
             .circuit_states = std.AutoHashMap(RouteId, CircuitState).init(services.allocator),
+            .lb_counters = std.AutoHashMap(usize, usize).init(services.allocator),
         };
     }
 
     pub fn deinit(self: *SyncExecutor) void {
         self.circuit_states.deinit();
+        self.lb_counters.deinit();
     }
 
     pub fn run(self: *SyncExecutor, plan: *const RoutePlan, route_id: RouteId, ex: *Exchange) !void {
@@ -289,6 +294,68 @@ pub const SyncExecutor = struct {
                         },
                     }
                 },
+
+                .Delay => |d| {
+                    @import("time_util.zig").sleepMs(@as(u64, d.ms));
+                },
+
+                .Log => |l| {
+                    const msg = try interpolateLog(ex, l.message);
+                    defer if (msg.ptr != l.message.ptr) ex.allocator.free(msg);
+                    switch (l.level) {
+                        .debug => std.log.debug("{s}", .{msg}),
+                        .info => std.log.info("{s}", .{msg}),
+                        .warn => std.log.warn("{s}", .{msg}),
+                        .err => std.log.err("{s}", .{msg}),
+                    }
+                },
+
+                .RoutingSlip => |rs| {
+                    if (ex.getHeader(rs.header)) |slip| {
+                        var it = std.mem.splitScalar(u8, slip, ',');
+                        while (it.next()) |uri_raw| {
+                            const uri = std.mem.trim(u8, uri_raw, " ");
+                            if (uri.len == 0) continue;
+                            const reg = self.registry orelse return error.RegistryRequired;
+                            const ep = try reg.resolve(ex.allocator, uri);
+                            try self.sendTo(.{ .endpoint = ep }, ex);
+                        }
+                    }
+                },
+
+                .LoadBalancer => |lb| {
+                    if (lb.routes.len == 0) return;
+                    const idx = switch (lb.strategy) {
+                        .round_robin => blk: {
+                            const key = @intFromPtr(lb.routes.ptr);
+                            const gop = try self.lb_counters.getOrPut(key);
+                            if (!gop.found_existing) gop.value_ptr.* = 0;
+                            const i = gop.value_ptr.* % lb.routes.len;
+                            gop.value_ptr.* += 1;
+                            break :blk i;
+                        },
+                        .random => blk: {
+                            const now = self.services.clock.nowMillis();
+                            break :blk @as(usize, @intCast(now % lb.routes.len));
+                        },
+                    };
+                    try self.run(plan, lb.routes[idx], ex);
+                },
+
+                .Transform => |t| try t.call(ex),
+            }
+
+            // Message history tracking
+            if (self.services.message_history) {
+                const step_name = stepName(step);
+                if (ex.getHeader("CamelMessageHistory")) |existing| {
+                    const new = try std.fmt.allocPrint(ex.allocator, "{s},{s}", .{ existing, step_name });
+                    ex.allocator.free(@constCast(existing));
+                    try ex.headers.put("CamelMessageHistory", @constCast(new));
+                } else {
+                    const duped = try ex.allocator.dupe(u8, step_name);
+                    try ex.headers.put("CamelMessageHistory", duped);
+                }
             }
         }
         if (self.services.metrics) |m| {
@@ -296,6 +363,72 @@ pub const SyncExecutor = struct {
             const name = std.fmt.bufPrint(&buf, "route.{d}.messages", .{route_id}) catch "route.?.messages";
             m.increment(name);
         }
+    }
+
+    fn interpolateLog(ex: *Exchange, template: []const u8) ![]u8 {
+        // Quick check if interpolation is needed
+        if (std.mem.indexOf(u8, template, "${") == null) {
+            // Return the original slice — caller checks ptr equality to avoid freeing
+            return @constCast(template);
+        }
+
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(ex.allocator);
+
+        var i: usize = 0;
+        while (i < template.len) {
+            if (i + 1 < template.len and template[i] == '$' and template[i + 1] == '{') {
+                const close = std.mem.indexOfScalarPos(u8, template, i + 2, '}') orelse {
+                    try result.append(ex.allocator, template[i]);
+                    i += 1;
+                    continue;
+                };
+                const key = template[i + 2 .. close];
+                if (std.mem.eql(u8, key, "body")) {
+                    try result.appendSlice(ex.allocator, ex.body);
+                } else if (std.mem.startsWith(u8, key, "header.")) {
+                    const hdr_key = key["header.".len..];
+                    const val = ex.getHeader(hdr_key) orelse "";
+                    try result.appendSlice(ex.allocator, val);
+                } else {
+                    // Unknown placeholder — output as-is
+                    try result.appendSlice(ex.allocator, template[i .. close + 1]);
+                }
+                i = close + 1;
+            } else {
+                try result.append(ex.allocator, template[i]);
+                i += 1;
+            }
+        }
+
+        return try result.toOwnedSlice(ex.allocator);
+    }
+
+    fn stepName(step: Step) []const u8 {
+        return switch (step) {
+            .Process => "Process",
+            .Filter => "Filter",
+            .To => "To",
+            .Choice => "Choice",
+            .Multicast => "Multicast",
+            .Split => "Split",
+            .Aggregate => "Aggregate",
+            .WireTap => "WireTap",
+            .RecipientList => "RecipientList",
+            .Throttle => "Throttle",
+            .IdempotentConsumer => "IdempotentConsumer",
+            .Enrich => "Enrich",
+            .Policy => "Policy",
+            .DoTry => "DoTry",
+            .Marshal => "Marshal",
+            .Unmarshal => "Unmarshal",
+            .ClaimCheck => "ClaimCheck",
+            .Delay => "Delay",
+            .Log => "Log",
+            .RoutingSlip => "RoutingSlip",
+            .LoadBalancer => "LoadBalancer",
+            .Transform => "Transform",
+        };
     }
 
     fn sendTo(self: *SyncExecutor, eref: EndpointRef, ex: *Exchange) !void {

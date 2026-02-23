@@ -42,4 +42,5 @@ pub const Services = struct {
     scheduler: ?Scheduler = null,
     store: ?StateStore = null,
     metrics: ?Metrics = null,
+    message_history: bool = false,
 };

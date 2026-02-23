@@ -2387,3 +2387,420 @@ test "bean in doTry catch" {
 
     try std.testing.expectEqualStrings("handled", ex.body);
 }
+
+// ======== Delay Step ========
+
+test "delay step passes message through" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.delay(0)).process(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// ======== Log Step ========
+
+test "log step does not error" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.log("test message")).process(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+test "log step with interpolation runs without error" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.setHeader("user", "alice")).log("Processing ${body} for ${header.user}")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("order-123");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    // Body should be unchanged (log is side-effect only)
+    try std.testing.expectEqualStrings("order-123", ex.body);
+}
+
+// ======== Message History ========
+
+test "message history disabled by default" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.process(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expect(ex.getHeader("CamelMessageHistory") == null);
+}
+
+test "message history enabled tracks steps" {
+    const alloc = std.testing.allocator;
+    var services = testServices(alloc);
+    services.message_history = true;
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.process(Processor.fromFn(uppercaseProcessor, null))).log("done")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    const history = ex.getHeader("CamelMessageHistory").?;
+    try std.testing.expectEqualStrings("Process,Log", history);
+}
+
+// ======== Mock Endpoint ========
+
+test "mock captures exchange body" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.toUri("mock:result")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("captured-data");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    const captures = mock_store.getCaptures("result").?;
+    try std.testing.expectEqual(@as(usize, 1), captures.len);
+    try std.testing.expectEqualStrings("captured-data", captures[0].body);
+}
+
+test "mock captures multiple exchanges" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.toUri("mock:multi")).build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("msg1");
+        try exec.run(&r.plan, 0, &ex);
+    }
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("msg2");
+        try exec.run(&r.plan, 0, &ex);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), mock_store.captureCount("multi"));
+    const captures = mock_store.getCaptures("multi").?;
+    try std.testing.expectEqualStrings("msg1", captures[0].body);
+    try std.testing.expectEqualStrings("msg2", captures[1].body);
+}
+
+test "mock captureCount works" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    // No captures yet
+    try std.testing.expectEqual(@as(usize, 0), mock_store.captureCount("test"));
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.toUri("mock:test")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("data");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("test"));
+}
+
+// ======== Routing Slip ========
+
+test "routing slip routes through multiple endpoints" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.routingSlip("slip")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("routed");
+    try ex.putHeader("slip", "mock:dest1,mock:dest2");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    exec.registry = &registry;
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("dest1"));
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("dest2"));
+}
+
+test "routing slip with missing header is no-op" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.routingSlip("missing-header")).process(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    exec.registry = &registry;
+    try exec.run(&r.plan, 0, &ex);
+
+    // Routing slip was no-op but subsequent process step still ran
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// ======== Load Balancer ========
+
+test "round-robin distributes across routes" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var lb = r.loadBalancer(.round_robin);
+    var b1 = lb.branch();
+    _ = try (try b1.toUri("mock:lb1")).endBranch();
+    var b2 = lb.branch();
+    _ = try (try b2.toUri("mock:lb2")).endBranch();
+    const rid = try (try lb.endLoadBalancer()).build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First message goes to lb1
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("msg1");
+        try exec.run(&r.plan, rid, &ex);
+    }
+
+    // Second message goes to lb2
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("msg2");
+        try exec.run(&r.plan, rid, &ex);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("lb1"));
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("lb2"));
+}
+
+test "round-robin cycles back" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var lb = r.loadBalancer(.round_robin);
+    var b1 = lb.branch();
+    _ = try (try b1.toUri("mock:cyc1")).endBranch();
+    var b2 = lb.branch();
+    _ = try (try b2.toUri("mock:cyc2")).endBranch();
+    const rid = try (try lb.endLoadBalancer()).build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // Send 3 messages: should go lb1, lb2, lb1
+    for (0..3) |_| {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("msg");
+        try exec.run(&r.plan, rid, &ex);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), mock_store.captureCount("cyc1"));
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("cyc2"));
+}
+
+test "load balancer with single route always uses it" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var lb = r.loadBalancer(.round_robin);
+    var b1 = lb.branch();
+    _ = try (try b1.process(Processor.fromFn(captureProcessor, null))).endBranch();
+    const rid = try (try lb.endLoadBalancer()).build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    for (0..3) |_| {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("single");
+        try exec.run(&r.plan, rid, &ex);
+    }
+
+    try std.testing.expectEqualStrings("single", captured());
+}
+
+// ======== Transform Step ========
+
+test "transform modifies body" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.transform(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}

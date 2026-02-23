@@ -12,6 +12,7 @@ const Services = @import("services.zig").Services;
 const direct = @import("direct.zig");
 const seda = @import("seda.zig");
 const bean = @import("bean.zig");
+const mock = @import("mock.zig");
 
 pub const BeanFn = bean.BeanFn;
 
@@ -34,6 +35,7 @@ pub const Registry = struct {
     seda_queues: std.StringHashMap(*seda.SedaQueue),
     bean_functions: std.StringHashMap(BeanFn),
     route_states: std.StringHashMap(RouteState),
+    mock_store: ?*mock.MockStore = null,
 
     pub fn init(services: Services) Registry {
         return .{
@@ -115,6 +117,10 @@ pub const Registry = struct {
         return self.route_states.get(name) orelse .started;
     }
 
+    pub fn setMockStore(self: *Registry, store: *mock.MockStore) void {
+        self.mock_store = store;
+    }
+
     pub fn getOrCreateSedaQueue(self: *Registry) !*seda.SedaQueue {
         const q = try self.services.allocator.create(seda.SedaQueue);
         q.* = seda.SedaQueue.init(self.services.allocator);
@@ -140,6 +146,8 @@ pub const Registry = struct {
             try @import("http.zig").makeHttpEndpoint(alloc, uri)
         else if (std.mem.eql(u8, parsed.scheme, "bean"))
             try self.resolveBeanEndpoint(alloc, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "mock"))
+            try self.resolveMockEndpoint(alloc, parsed.rest)
         else if (self.endpoint_factories.get(parsed.scheme)) |factory|
             try factory(alloc, parsed.rest)
         else
@@ -148,6 +156,11 @@ pub const Registry = struct {
         const key = try alloc.dupe(u8, uri);
         try self.cache.put(key, ep);
         return ep;
+    }
+
+    fn resolveMockEndpoint(self: *Registry, allocator: std.mem.Allocator, name: []const u8) !Endpoint {
+        const store = self.mock_store orelse return error.MockStoreNotSet;
+        return try mock.makeMockEndpoint(allocator, name, store);
     }
 
     fn resolveBeanEndpoint(self: *Registry, allocator: std.mem.Allocator, name: []const u8) !Endpoint {

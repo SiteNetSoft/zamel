@@ -31,11 +31,16 @@ pub const RouteState = @import("registry.zig").RouteState;
 pub const BeanFn = @import("registry.zig").BeanFn;
 pub const RtBuilder = @import("builder_rt.zig").RtBuilder;
 
+pub const LogLevel = @import("step.zig").LogLevel;
+pub const LoadBalancerStrategy = @import("step.zig").LoadBalancerStrategy;
+pub const MockStore = @import("mock.zig").MockStore;
+
 pub const consumers = @import("consumers.zig");
 pub const pred = @import("predicates.zig");
 pub const proc = @import("processors.zig");
 pub const marshal = @import("marshal.zig");
 pub const time_util = @import("time_util.zig");
+pub const mock = @import("mock.zig");
 pub const SedaQueue = @import("seda.zig").SedaQueue;
 
 test {
