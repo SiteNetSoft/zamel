@@ -11,6 +11,11 @@ const SyncExecutor = @import("executor_sync.zig").SyncExecutor;
 const Services = @import("services.zig").Services;
 const direct = @import("direct.zig");
 const seda = @import("seda.zig");
+const bean = @import("bean.zig");
+
+pub const BeanFn = bean.BeanFn;
+
+pub const RouteState = enum { started, stopped, suspended };
 
 pub const EndpointFactory = *const fn (allocator: std.mem.Allocator, rest: []const u8) anyerror!Endpoint;
 pub const ConsumerFactory = *const fn (allocator: std.mem.Allocator, rest: []const u8) anyerror!Consumer;
@@ -27,6 +32,8 @@ pub const Registry = struct {
     consumer_factories: std.StringHashMap(ConsumerFactory),
     named_routes: std.StringHashMap(NamedRoute),
     seda_queues: std.StringHashMap(*seda.SedaQueue),
+    bean_functions: std.StringHashMap(BeanFn),
+    route_states: std.StringHashMap(RouteState),
 
     pub fn init(services: Services) Registry {
         return .{
@@ -36,6 +43,8 @@ pub const Registry = struct {
             .consumer_factories = std.StringHashMap(ConsumerFactory).init(services.allocator),
             .named_routes = std.StringHashMap(NamedRoute).init(services.allocator),
             .seda_queues = std.StringHashMap(*seda.SedaQueue).init(services.allocator),
+            .bean_functions = std.StringHashMap(BeanFn).init(services.allocator),
+            .route_states = std.StringHashMap(RouteState).init(services.allocator),
         };
     }
 
@@ -50,6 +59,8 @@ pub const Registry = struct {
         self.endpoint_factories.deinit();
         self.consumer_factories.deinit();
         self.named_routes.deinit();
+        self.bean_functions.deinit();
+        self.route_states.deinit();
 
         // Clean up seda queues
         var sq_it = self.seda_queues.iterator();
@@ -78,6 +89,32 @@ pub const Registry = struct {
         return self.named_routes.get(name);
     }
 
+    pub fn registerBean(self: *Registry, name: []const u8, func: BeanFn) !void {
+        try self.bean_functions.put(name, func);
+    }
+
+    // ---- route lifecycle ----
+
+    pub fn startRoute(self: *Registry, name: []const u8) !void {
+        try self.route_states.put(name, .started);
+    }
+
+    pub fn stopRoute(self: *Registry, name: []const u8) !void {
+        try self.route_states.put(name, .stopped);
+    }
+
+    pub fn suspendRoute(self: *Registry, name: []const u8) !void {
+        try self.route_states.put(name, .suspended);
+    }
+
+    pub fn resumeRoute(self: *Registry, name: []const u8) !void {
+        try self.route_states.put(name, .started);
+    }
+
+    pub fn getRouteState(self: *Registry, name: []const u8) RouteState {
+        return self.route_states.get(name) orelse .started;
+    }
+
     pub fn getOrCreateSedaQueue(self: *Registry) !*seda.SedaQueue {
         const q = try self.services.allocator.create(seda.SedaQueue);
         q.* = seda.SedaQueue.init(self.services.allocator);
@@ -101,6 +138,8 @@ pub const Registry = struct {
             try self.resolveSedaEndpoint(alloc, parsed.rest)
         else if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https"))
             try @import("http.zig").makeHttpEndpoint(alloc, uri)
+        else if (std.mem.eql(u8, parsed.scheme, "bean"))
+            try self.resolveBeanEndpoint(alloc, parsed.rest)
         else if (self.endpoint_factories.get(parsed.scheme)) |factory|
             try factory(alloc, parsed.rest)
         else
@@ -109,6 +148,11 @@ pub const Registry = struct {
         const key = try alloc.dupe(u8, uri);
         try self.cache.put(key, ep);
         return ep;
+    }
+
+    fn resolveBeanEndpoint(self: *Registry, allocator: std.mem.Allocator, name: []const u8) !Endpoint {
+        const func = self.bean_functions.get(name) orelse return error.BeanNotFound;
+        return try bean.makeBeanEndpoint(allocator, func);
     }
 
     fn resolveSedaEndpoint(self: *Registry, allocator: std.mem.Allocator, name: []const u8) !Endpoint {

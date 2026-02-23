@@ -6,6 +6,8 @@ const Step = @import("step.zig").Step;
 const PolicyKind = @import("step.zig").PolicyKind;
 const RouteId = @import("step.zig").RouteId;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
+const marshal = @import("marshal.zig");
+const Metrics = @import("metrics.zig").Metrics;
 
 const CircuitState = struct {
     failures: u32 = 0,
@@ -28,6 +30,13 @@ pub const SyncExecutor = struct {
     }
 
     pub fn run(self: *SyncExecutor, plan: *const RoutePlan, route_id: RouteId, ex: *Exchange) !void {
+        errdefer {
+            if (self.services.metrics) |m| {
+                var buf: [64]u8 = undefined;
+                const name = std.fmt.bufPrint(&buf, "route.{d}.errors", .{route_id}) catch "route.?.errors";
+                m.increment(name);
+            }
+        }
         const route = plan.route(route_id);
         for (route.steps) |step| {
             switch (step) {
@@ -179,6 +188,49 @@ pub const SyncExecutor = struct {
                     }
                 },
 
+                .DoTry => |dt| {
+                    if (self.run(plan, dt.try_route, ex)) {} else |err| {
+                        // Set exception header
+                        try ex.putHeader("CamelExceptionMessage", @errorName(err));
+                        // Run catch route if present
+                        if (dt.catch_route) |cid| {
+                            try self.run(plan, cid, ex);
+                        }
+                    }
+                    // Always run finally route if present
+                    if (dt.finally_route) |fid| {
+                        try self.run(plan, fid, ex);
+                    }
+                },
+
+                .Marshal => |m| {
+                    switch (m.format) {
+                        .json => try marshal.marshalJson(ex),
+                    }
+                },
+
+                .Unmarshal => |u| {
+                    switch (u.format) {
+                        .json => try marshal.unmarshalJson(ex),
+                    }
+                },
+
+                .ClaimCheck => |cc| {
+                    const store = self.services.store orelse return error.StateStoreRequired;
+                    switch (cc.action) {
+                        .store => {
+                            try store.put(cc.key, ex.body);
+                            try ex.setBody(cc.key);
+                        },
+                        .retrieve => {
+                            if (try store.get(ex.allocator, cc.key)) |val| {
+                                if (ex.body.len != 0) ex.allocator.free(ex.body);
+                                ex.body = val;
+                            }
+                        },
+                    }
+                },
+
                 .Policy => |pol| {
                     switch (pol.kind) {
                         .Retry => |retry| {
@@ -238,6 +290,11 @@ pub const SyncExecutor = struct {
                     }
                 },
             }
+        }
+        if (self.services.metrics) |m| {
+            var buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "route.{d}.messages", .{route_id}) catch "route.?.messages";
+            m.increment(name);
         }
     }
 

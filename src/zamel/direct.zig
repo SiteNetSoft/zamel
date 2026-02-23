@@ -34,6 +34,13 @@ fn directCreateProducer(ctx: ?*anyopaque, _: std.mem.Allocator) !Producer {
 
 fn directSend(ctx: ?*anyopaque, ex: *Exchange) !void {
     const c: *const DirectCtx = @ptrCast(@alignCast(ctx.?));
+    // Check route lifecycle state
+    const state = c.registry.getRouteState(c.name);
+    switch (state) {
+        .stopped => return error.RouteStopped,
+        .suspended => return error.RouteSuspended,
+        .started => {},
+    }
     const named = c.registry.lookupRoute(c.name) orelse return error.DirectRouteNotFound;
     var exec = SyncExecutor.init(c.registry.services);
     defer exec.deinit();

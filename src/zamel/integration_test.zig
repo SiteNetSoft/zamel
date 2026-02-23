@@ -1879,3 +1879,511 @@ test "idempotent + direct combined" {
         try std.testing.expectEqualStrings("hello again", ex.body);
     }
 }
+
+// ======== DoTry/DoCatch/DoFinally (Error Handler DSL) ========
+
+test "doTry catches error and runs catch route" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var dt = r.doTry();
+    _ = try dt.process(Processor.fromFn(alwaysFailProcessor, null));
+    var dc = dt.doCatch();
+    _ = try dc.process(Processor.fromFn(captureProcessor, null));
+    _ = try dc.endDoTry();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("try-data");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    // Catch route should have captured the body
+    try std.testing.expectEqualStrings("try-data", captured());
+    // Exception header should be set
+    try std.testing.expect(ex.getHeader("CamelExceptionMessage") != null);
+}
+
+test "doTry runs finally on success" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var dt = r.doTry();
+    _ = try dt.process(Processor.fromFn(uppercaseProcessor, null));
+    var df = dt.doFinally();
+    _ = try df.process(Processor.fromFn(captureProcessor, null));
+    _ = try df.endDoTry();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    // Finally should have captured the uppercased body
+    try std.testing.expectEqualStrings("HELLO", captured());
+}
+
+test "doTry runs catch then finally on error" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var dt = r.doTry();
+    _ = try dt.process(Processor.fromFn(alwaysFailProcessor, null));
+    var dc = dt.doCatch();
+    _ = try dc.setBody("caught");
+    var df = dc.doFinally();
+    _ = try df.process(Processor.fromFn(captureProcessor, null));
+    _ = try df.endDoTry();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("original");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    // Catch set body to "caught", finally captured it
+    try std.testing.expectEqualStrings("caught", captured());
+}
+
+test "doTry without catch propagates no error when finally succeeds" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    capture_len = 0;
+
+    var dt = r.doTry();
+    _ = try dt.process(Processor.fromFn(uppercaseProcessor, null));
+    _ = try dt.endDoTry();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("TEST", ex.body);
+}
+
+// ======== Bean Endpoint ========
+
+test "bean endpoint via registry" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    try registry.registerBean("myBean", struct {
+        fn call(ex: *Exchange) !void {
+            try ex.setBody("bean-output");
+        }
+    }.call);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.toUri("bean:myBean")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("input");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("bean-output", ex.body);
+}
+
+test "bean endpoint not found" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    try std.testing.expectError(error.BeanNotFound, registry.resolve(alloc, "bean:unknown"));
+}
+
+// ======== JSON Marshal/Unmarshal ========
+
+test "marshal json via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.setHeader("color", "red")).marshalJson()).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    // Body should contain JSON with the header
+    try std.testing.expect(std.mem.indexOf(u8, ex.body, "\"color\":\"red\"") != null);
+}
+
+test "unmarshal json via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.unmarshalJson()).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("{\"fruit\":\"apple\"}");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("apple", ex.getHeader("fruit").?);
+}
+
+test "marshal then unmarshal roundtrip via executor" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Route 1: marshal
+    var r1 = RtBuilder.init(alloc, &registry);
+    defer r1.deinit();
+    _ = try (try r1.marshalJson()).build();
+
+    // Route 2: unmarshal
+    var r2 = RtBuilder.init(alloc, &registry);
+    defer r2.deinit();
+    _ = try (try r2.unmarshalJson()).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.putHeader("key", "value");
+
+    // Marshal
+    var exec1 = SyncExecutor.init(services);
+    defer exec1.deinit();
+    try exec1.run(&r1.plan, 0, &ex);
+
+    // Body now has JSON
+    try std.testing.expect(ex.body.len > 0);
+
+    // Unmarshal into new exchange
+    var ex2 = Exchange.init(alloc);
+    defer ex2.deinit();
+    try ex2.setBody(ex.body);
+
+    var exec2 = SyncExecutor.init(services);
+    defer exec2.deinit();
+    try exec2.run(&r2.plan, 0, &ex2);
+
+    try std.testing.expectEqualStrings("value", ex2.getHeader("key").?);
+}
+
+// ======== Claim Check ========
+
+test "claim check store and retrieve" {
+    const alloc = std.testing.allocator;
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+
+    const services = testServicesWithStore(alloc, &store);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try (try r.claimCheckStore("claim-1")).setBody("replaced")).claimCheckRetrieve("claim-1")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("important-data");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    // Store saved "important-data", setBody replaced with "replaced",
+    // then retrieve restored "important-data"
+    try std.testing.expectEqualStrings("important-data", ex.body);
+}
+
+test "claim check store requires state store" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc); // No store
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .ClaimCheck = .{ .action = .store, .key = "k" } }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("data");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try std.testing.expectError(error.StateStoreRequired, exec.run(&plan, rid, &ex));
+}
+
+// ======== Route Lifecycle ========
+
+test "route lifecycle: stop prevents direct endpoint" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    // Register a route
+    var r1 = RtBuilder.init(alloc, &registry);
+    defer r1.deinit();
+    _ = try (try r1.process(Processor.fromFn(uppercaseProcessor, null))).build();
+    try registry.registerRoute("stoppable", &r1.plan, 0);
+
+    // Stop the route
+    try registry.stopRoute("stoppable");
+
+    // Try to send to it
+    var r2 = RtBuilder.init(alloc, &registry);
+    defer r2.deinit();
+    _ = try (try r2.toUri("direct:stoppable")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try std.testing.expectError(error.RouteStopped, exec.run(&r2.plan, 0, &ex));
+}
+
+test "route lifecycle: suspend prevents direct endpoint" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r1 = RtBuilder.init(alloc, &registry);
+    defer r1.deinit();
+    _ = try (try r1.process(Processor.fromFn(uppercaseProcessor, null))).build();
+    try registry.registerRoute("suspendable", &r1.plan, 0);
+
+    try registry.suspendRoute("suspendable");
+
+    var r2 = RtBuilder.init(alloc, &registry);
+    defer r2.deinit();
+    _ = try (try r2.toUri("direct:suspendable")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try std.testing.expectError(error.RouteSuspended, exec.run(&r2.plan, 0, &ex));
+}
+
+test "route lifecycle: resume after suspend" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r1 = RtBuilder.init(alloc, &registry);
+    defer r1.deinit();
+    _ = try (try r1.process(Processor.fromFn(uppercaseProcessor, null))).build();
+    try registry.registerRoute("resumable", &r1.plan, 0);
+
+    try registry.suspendRoute("resumable");
+    try registry.resumeRoute("resumable");
+
+    var r2 = RtBuilder.init(alloc, &registry);
+    defer r2.deinit();
+    _ = try (try r2.toUri("direct:resumable")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r2.plan, 0, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+test "route lifecycle: default state is started" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(zamel.RouteState.started, registry.getRouteState("any-route"));
+}
+
+// ======== Metrics ========
+
+test "metrics increment on successful route" {
+    const alloc = std.testing.allocator;
+
+    var mem_metrics = zamel.InMemoryMetrics.init(alloc);
+    defer mem_metrics.deinit();
+
+    const services: Services = .{
+        .allocator = alloc,
+        .clock = .{ .nowMillisFn = testClock, .ctx = null },
+        .metrics = mem_metrics.metrics(),
+    };
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.process(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqual(@as(u64, 1), mem_metrics.getCounter("route.0.messages").?);
+}
+
+test "metrics increment errors on failure" {
+    const alloc = std.testing.allocator;
+
+    var mem_metrics = zamel.InMemoryMetrics.init(alloc);
+    defer mem_metrics.deinit();
+
+    const services: Services = .{
+        .allocator = alloc,
+        .clock = .{ .nowMillisFn = testClock, .ctx = null },
+        .metrics = mem_metrics.metrics(),
+    };
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(alwaysFailProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    _ = exec.run(&plan, rid, &ex) catch {};
+
+    try std.testing.expectEqual(@as(u64, 1), mem_metrics.getCounter("route.0.errors").?);
+}
+
+// ======== Bean + doTry combined ========
+
+test "bean in doTry catch" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    try registry.registerBean("errorHandler", struct {
+        fn call(ex: *Exchange) !void {
+            try ex.setBody("handled");
+        }
+    }.call);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var dt = r.doTry();
+    _ = try dt.process(Processor.fromFn(alwaysFailProcessor, null));
+    var dc = dt.doCatch();
+    _ = try dc.toUri("bean:errorHandler");
+    _ = try dc.endDoTry();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("will-fail");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("handled", ex.body);
+}

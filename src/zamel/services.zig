@@ -34,9 +34,12 @@ pub const StateStore = struct {
     }
 };
 
+pub const Metrics = @import("metrics.zig").Metrics;
+
 pub const Services = struct {
     allocator: std.mem.Allocator,
     clock: Clock,
     scheduler: ?Scheduler = null,
     store: ?StateStore = null,
+    metrics: ?Metrics = null,
 };

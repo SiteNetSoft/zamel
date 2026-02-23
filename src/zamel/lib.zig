@@ -13,22 +13,35 @@ pub const ConsumerFactory = @import("registry.zig").ConsumerFactory;
 
 pub const Step = @import("step.zig").Step;
 pub const SplitKind = @import("step.zig").SplitKind;
+pub const DataFormat = @import("step.zig").DataFormat;
+pub const ClaimCheckAction = @import("step.zig").ClaimCheckAction;
 pub const RoutePlan = @import("plan.zig").RoutePlan;
 
 pub const Services = @import("services.zig").Services;
 pub const StateStore = @import("services.zig").StateStore;
 pub const InMemoryStore = @import("state_store.zig").InMemoryStore;
 pub const SyncExecutor = @import("executor_sync.zig").SyncExecutor;
+pub const ThreadedExecutor = @import("executor_threaded.zig").ThreadedExecutor;
+
+pub const Metrics = @import("metrics.zig").Metrics;
+pub const InMemoryMetrics = @import("metrics.zig").InMemoryMetrics;
 
 pub const Registry = @import("registry.zig").Registry;
+pub const RouteState = @import("registry.zig").RouteState;
+pub const BeanFn = @import("registry.zig").BeanFn;
 pub const RtBuilder = @import("builder_rt.zig").RtBuilder;
 
 pub const consumers = @import("consumers.zig");
 pub const pred = @import("predicates.zig");
 pub const proc = @import("processors.zig");
+pub const marshal = @import("marshal.zig");
 pub const time_util = @import("time_util.zig");
 pub const SedaQueue = @import("seda.zig").SedaQueue;
 
 test {
     _ = @import("integration_test.zig");
+    _ = @import("bean.zig");
+    _ = @import("marshal.zig");
+    _ = @import("metrics.zig");
+    _ = @import("executor_threaded.zig");
 }

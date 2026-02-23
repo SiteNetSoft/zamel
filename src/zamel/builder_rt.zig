@@ -3,6 +3,8 @@ const Step = @import("step.zig").Step;
 const ChoiceBranch = @import("step.zig").ChoiceBranch;
 const PolicyKind = @import("step.zig").PolicyKind;
 const SplitKind = @import("step.zig").SplitKind;
+const DataFormat = @import("step.zig").DataFormat;
+const ClaimCheckAction = @import("step.zig").ClaimCheckAction;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const RouteId = @import("step.zig").RouteId;
 
@@ -181,6 +183,44 @@ pub const RtBuilder = struct {
         return IdempotentBuilder.init(self, key_header);
     }
 
+    // ---- doTry DSL ----
+
+    pub fn doTry(self: *RtBuilder) DoTryBuilder {
+        return DoTryBuilder.init(self);
+    }
+
+    // ---- marshal/unmarshal ----
+
+    pub fn marshal(self: *RtBuilder, format: DataFormat) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *RtBuilder, format: DataFormat) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn marshalJson(self: *RtBuilder) !*RtBuilder {
+        return try self.marshal(.json);
+    }
+
+    pub fn unmarshalJson(self: *RtBuilder) !*RtBuilder {
+        return try self.unmarshal(.json);
+    }
+
+    // ---- claim check ----
+
+    pub fn claimCheckStore(self: *RtBuilder, key: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *RtBuilder, key: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
     // ---- enrich ----
 
     pub fn enrich(self: *RtBuilder, ep: EndpointRef, merge: ?Processor) !*RtBuilder {
@@ -306,6 +346,26 @@ pub const WhenBuilder = struct {
         return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
+    pub fn marshal(self: *WhenBuilder, format: DataFormat) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *WhenBuilder, format: DataFormat) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *WhenBuilder, key: []const u8) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *WhenBuilder, key: []const u8) !*WhenBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
     pub fn endWhen(self: *WhenBuilder) !*ChoiceBuilder {
         const a = self.alloc();
         const rid = try self.choice.parent.plan.addRoute(a, self.steps.items);
@@ -369,6 +429,26 @@ pub const OtherwiseBuilder = struct {
     pub fn enrichUri(self: *OtherwiseBuilder, uri: []const u8, merge: ?Processor) !*OtherwiseBuilder {
         const ep = try self.choice.parent.registry.resolve(self.alloc(), uri);
         return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
+    pub fn marshal(self: *OtherwiseBuilder, format: DataFormat) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *OtherwiseBuilder, format: DataFormat) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *OtherwiseBuilder, key: []const u8) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *OtherwiseBuilder, key: []const u8) !*OtherwiseBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
     }
 
     pub fn endOtherwise(self: *OtherwiseBuilder) !*ChoiceBuilder {
@@ -435,6 +515,26 @@ pub const PolicyBuilder = struct {
     pub fn enrichUri(self: *PolicyBuilder, uri: []const u8, merge: ?Processor) !*PolicyBuilder {
         const ep = try self.parent.registry.resolve(self.alloc(), uri);
         return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
+    pub fn marshal(self: *PolicyBuilder, format: DataFormat) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *PolicyBuilder, format: DataFormat) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *PolicyBuilder, key: []const u8) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *PolicyBuilder, key: []const u8) !*PolicyBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
     }
 
     pub fn endPolicy(self: *PolicyBuilder) !*RtBuilder {
@@ -506,6 +606,26 @@ pub const SplitBuilder = struct {
         return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
+    pub fn marshal(self: *SplitBuilder, format: DataFormat) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *SplitBuilder, format: DataFormat) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *SplitBuilder, key: []const u8) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *SplitBuilder, key: []const u8) !*SplitBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
     pub fn endSplit(self: *SplitBuilder) !*RtBuilder {
         const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.parent.cur_steps.append(self.alloc(), .{ .Split = .{
@@ -573,6 +693,26 @@ pub const AggregateBuilder = struct {
     pub fn enrichUri(self: *AggregateBuilder, uri: []const u8, merge: ?Processor) !*AggregateBuilder {
         const ep = try self.parent.registry.resolve(self.alloc(), uri);
         return try self.enrich(.{ .endpoint = ep }, merge);
+    }
+
+    pub fn marshal(self: *AggregateBuilder, format: DataFormat) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *AggregateBuilder, format: DataFormat) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *AggregateBuilder, key: []const u8) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *AggregateBuilder, key: []const u8) !*AggregateBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
     }
 
     pub fn endAggregate(self: *AggregateBuilder) !*RtBuilder {
@@ -669,6 +809,26 @@ pub const MulticastBranchBuilder = struct {
         return try self.enrich(.{ .endpoint = ep }, merge);
     }
 
+    pub fn marshal(self: *MulticastBranchBuilder, format: DataFormat) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *MulticastBranchBuilder, format: DataFormat) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *MulticastBranchBuilder, key: []const u8) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *MulticastBranchBuilder, key: []const u8) !*MulticastBranchBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
     pub fn endBranch(self: *MulticastBranchBuilder) !*MulticastBuilder {
         const rid = try self.mc.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.mc.routes.append(self.alloc(), rid);
@@ -725,6 +885,26 @@ pub const IdempotentBuilder = struct {
         return try self.process(try processors.removeHeader(self.alloc(), key));
     }
 
+    pub fn marshal(self: *IdempotentBuilder, format: DataFormat) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Marshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn unmarshal(self: *IdempotentBuilder, format: DataFormat) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .Unmarshal = .{ .format = format } });
+        return self;
+    }
+
+    pub fn claimCheckStore(self: *IdempotentBuilder, key: []const u8) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .store, .key = key } });
+        return self;
+    }
+
+    pub fn claimCheckRetrieve(self: *IdempotentBuilder, key: []const u8) !*IdempotentBuilder {
+        try self.steps.append(self.alloc(), .{ .ClaimCheck = .{ .action = .retrieve, .key = key } });
+        return self;
+    }
+
     pub fn endIdempotent(self: *IdempotentBuilder) !*RtBuilder {
         const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.parent.cur_steps.append(self.alloc(), .{ .IdempotentConsumer = .{
@@ -732,5 +912,190 @@ pub const IdempotentBuilder = struct {
             .route = rid,
         } });
         return self.parent;
+    }
+};
+
+pub const DoTryBuilder = struct {
+    parent: *RtBuilder,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder) DoTryBuilder {
+        return .{
+            .parent = parent,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *DoTryBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *DoTryBuilder, p: Processor) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *DoTryBuilder, pred: Predicate) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *DoTryBuilder, ep: EndpointRef) !*DoTryBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *DoTryBuilder, uri: []const u8) !*DoTryBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *DoTryBuilder, value: []const u8) !*DoTryBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *DoTryBuilder, key: []const u8, value: []const u8) !*DoTryBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *DoTryBuilder, key: []const u8) !*DoTryBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn doCatch(self: *DoTryBuilder) DoCatchBuilder {
+        return DoCatchBuilder.init(self);
+    }
+
+    pub fn doFinally(self: *DoTryBuilder) DoFinallyBuilder {
+        return DoFinallyBuilder.init(self, null);
+    }
+
+    pub fn endDoTry(self: *DoTryBuilder) !*RtBuilder {
+        return self.finalize(null, null);
+    }
+
+    fn finalize(self: *DoTryBuilder, catch_steps: ?[]Step, finally_steps: ?[]Step) !*RtBuilder {
+        const a = self.alloc();
+        const try_rid = try self.parent.plan.addRoute(a, self.steps.items);
+        var catch_rid: ?RouteId = null;
+        var finally_rid: ?RouteId = null;
+        if (catch_steps) |cs| catch_rid = try self.parent.plan.addRoute(a, cs);
+        if (finally_steps) |fs| finally_rid = try self.parent.plan.addRoute(a, fs);
+        try self.parent.cur_steps.append(a, .{ .DoTry = .{
+            .try_route = try_rid,
+            .catch_route = catch_rid,
+            .finally_route = finally_rid,
+        } });
+        return self.parent;
+    }
+};
+
+pub const DoCatchBuilder = struct {
+    try_builder: *DoTryBuilder,
+    steps: std.ArrayList(Step),
+
+    pub fn init(try_builder: *DoTryBuilder) DoCatchBuilder {
+        return .{
+            .try_builder = try_builder,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *DoCatchBuilder) std.mem.Allocator {
+        return self.try_builder.alloc();
+    }
+
+    pub fn process(self: *DoCatchBuilder, p: Processor) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *DoCatchBuilder, pred: Predicate) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *DoCatchBuilder, ep: EndpointRef) !*DoCatchBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *DoCatchBuilder, uri: []const u8) !*DoCatchBuilder {
+        const ep = try self.try_builder.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *DoCatchBuilder, value: []const u8) !*DoCatchBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *DoCatchBuilder, key: []const u8, value: []const u8) !*DoCatchBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *DoCatchBuilder, key: []const u8) !*DoCatchBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn doFinally(self: *DoCatchBuilder) DoFinallyBuilder {
+        return DoFinallyBuilder.init(self.try_builder, self.steps.items);
+    }
+
+    pub fn endDoTry(self: *DoCatchBuilder) !*RtBuilder {
+        return self.try_builder.finalize(self.steps.items, null);
+    }
+};
+
+pub const DoFinallyBuilder = struct {
+    try_builder: *DoTryBuilder,
+    catch_steps: ?[]Step,
+    steps: std.ArrayList(Step),
+
+    pub fn init(try_builder: *DoTryBuilder, catch_steps: ?[]Step) DoFinallyBuilder {
+        return .{
+            .try_builder = try_builder,
+            .catch_steps = catch_steps,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *DoFinallyBuilder) std.mem.Allocator {
+        return self.try_builder.alloc();
+    }
+
+    pub fn process(self: *DoFinallyBuilder, p: Processor) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *DoFinallyBuilder, pred: Predicate) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *DoFinallyBuilder, ep: EndpointRef) !*DoFinallyBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *DoFinallyBuilder, uri: []const u8) !*DoFinallyBuilder {
+        const ep = try self.try_builder.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *DoFinallyBuilder, value: []const u8) !*DoFinallyBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *DoFinallyBuilder, key: []const u8, value: []const u8) !*DoFinallyBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn removeHeader(self: *DoFinallyBuilder, key: []const u8) !*DoFinallyBuilder {
+        return try self.process(try processors.removeHeader(self.alloc(), key));
+    }
+
+    pub fn endDoTry(self: *DoFinallyBuilder) !*RtBuilder {
+        return self.try_builder.finalize(self.catch_steps, self.steps.items);
     }
 };

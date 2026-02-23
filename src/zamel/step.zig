@@ -71,6 +71,23 @@ pub const Step = union(enum) {
         kind: PolicyKind,
         route: RouteId,
     },
+
+    // Error handler: doTry/doCatch/doFinally
+    DoTry: struct {
+        try_route: RouteId,
+        catch_route: ?RouteId = null,
+        finally_route: ?RouteId = null,
+    },
+
+    // JSON marshal/unmarshal
+    Marshal: struct { format: DataFormat },
+    Unmarshal: struct { format: DataFormat },
+
+    // Claim check: store/retrieve body via StateStore
+    ClaimCheck: struct {
+        action: ClaimCheckAction,
+        key: []const u8,
+    },
 };
 
 pub const SplitKind = union(enum) {
@@ -78,6 +95,10 @@ pub const SplitKind = union(enum) {
     sequence: []const u8,
     custom: Splitter,
 };
+
+pub const DataFormat = enum { json };
+
+pub const ClaimCheckAction = enum { store, retrieve };
 
 pub const PolicyKind = union(enum) {
     Retry: struct { max: u32, backoff_ms: u32 = 0 },
