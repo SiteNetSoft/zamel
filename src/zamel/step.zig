@@ -111,6 +111,11 @@ pub const Step = union(enum) {
 
     // Transform: like Process but semantically indicates body transformation
     Transform: Processor,
+
+    // Dynamic router: route to endpoint URI stored in a header
+    DynamicRouter: struct {
+        header: []const u8,
+    },
 };
 
 pub const SplitKind = union(enum) {
@@ -130,6 +135,14 @@ pub const LoadBalancerStrategy = enum { round_robin, random };
 pub const PolicyKind = union(enum) {
     Retry: struct { max: u32, backoff_ms: u32 = 0 },
     Timeout: struct { ms: u32 },
-    DeadLetter: struct { endpoint: EndpointRef },
-    CircuitBreaker: struct { failure_threshold: u32, reset_ms: u32 },
+    DeadLetter: struct {
+        endpoint: EndpointRef,
+        retries: u32 = 0,
+        retry_backoff_ms: u32 = 0,
+    },
+    CircuitBreaker: struct {
+        failure_threshold: u32,
+        reset_ms: u32,
+        success_threshold: u32 = 1,
+    },
 };

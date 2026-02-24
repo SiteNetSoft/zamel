@@ -13,6 +13,8 @@ const Registry = @import("registry.zig").Registry;
 const CircuitState = struct {
     failures: u32 = 0,
     open_until_ms: u64 = 0,
+    half_open: bool = false,
+    half_open_successes: u32 = 0,
 };
 
 pub const SyncExecutor = struct {
@@ -254,17 +256,77 @@ pub const SyncExecutor = struct {
                             if (last_err) |err| return err;
                         },
                         .Timeout => |t| {
+                            // Thread-based timeout: run route in a thread, wait with timeout
                             const start_ms = self.services.clock.nowMillis();
-                            try self.run(plan, pol.route, ex);
+
+                            const Ctx = struct {
+                                executor: *SyncExecutor,
+                                plan_ptr: *const RoutePlan,
+                                route_id: RouteId,
+                                ex_ptr: *Exchange,
+                                result: anyerror!void = {},
+                                done: std.Thread.ResetEvent = .unset,
+                            };
+                            var tctx = Ctx{
+                                .executor = self,
+                                .plan_ptr = plan,
+                                .route_id = pol.route,
+                                .ex_ptr = ex,
+                            };
+
+                            const thread = std.Thread.spawn(.{}, struct {
+                                fn run(c: *Ctx) void {
+                                    c.result = c.executor.run(c.plan_ptr, c.route_id, c.ex_ptr);
+                                    c.done.set();
+                                }
+                            }.run, .{&tctx}) catch {
+                                // Fallback to synchronous check if thread spawn fails
+                                try self.run(plan, pol.route, ex);
+                                const elapsed = self.services.clock.nowMillis() - start_ms;
+                                if (elapsed > @as(u64, t.ms)) return error.TimeoutExceeded;
+                                return;
+                            };
+
+                            tctx.done.timedWait(@as(u64, t.ms) * std.time.ns_per_ms) catch {
+                                // Timeout expired — still join thread for cleanup
+                                thread.join();
+                                return error.TimeoutExceeded;
+                            };
+
+                            thread.join();
+                            try tctx.result;
+
+                            // Also check logical clock for backward compatibility
                             const elapsed = self.services.clock.nowMillis() - start_ms;
                             if (elapsed > @as(u64, t.ms)) return error.TimeoutExceeded;
                         },
 
                         .DeadLetter => |dl| {
-                            self.run(plan, pol.route, ex) catch {
-                                // Route failed — send to dead letter endpoint
+                            var last_err: ?anyerror = null;
+                            const attempts: u32 = dl.retries + 1;
+                            for (0..attempts) |attempt| {
+                                if (self.run(plan, pol.route, ex)) {
+                                    last_err = null;
+                                    break;
+                                } else |err| {
+                                    last_err = err;
+                                    if (attempt + 1 < attempts and dl.retry_backoff_ms > 0) {
+                                        @import("time_util.zig").sleepMs(@as(u64, dl.retry_backoff_ms));
+                                    }
+                                }
+                            }
+                            if (last_err) |err| {
+                                // Enrich exchange with error metadata
+                                try ex.putHeader("CamelExceptionMessage", @errorName(err));
+                                var ts_buf: [32]u8 = undefined;
+                                const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{self.services.clock.nowMillis()}) catch "0";
+                                try ex.putHeader("CamelExceptionTimestamp", ts_str);
+                                var rid_buf: [16]u8 = undefined;
+                                const rid_str = std.fmt.bufPrint(&rid_buf, "{d}", .{pol.route}) catch "?";
+                                try ex.putHeader("CamelFailedRouteId", rid_str);
+                                // Send to dead letter endpoint
                                 try self.sendTo(dl.endpoint, ex);
-                            };
+                            }
                         },
 
                         .CircuitBreaker => |cb| {
@@ -274,20 +336,37 @@ pub const SyncExecutor = struct {
                             const now = self.services.clock.nowMillis();
 
                             // If circuit is open, check if reset period elapsed
-                            if (state.value_ptr.failures >= cb.failure_threshold) {
+                            if (state.value_ptr.failures >= cb.failure_threshold and !state.value_ptr.half_open) {
                                 if (now < state.value_ptr.open_until_ms) {
                                     return error.CircuitOpen;
                                 }
-                                // Half-open: reset and try
-                                state.value_ptr.failures = 0;
+                                // Enter half-open: allow a probe
+                                state.value_ptr.half_open = true;
+                                state.value_ptr.half_open_successes = 0;
                             }
 
                             if (self.run(plan, pol.route, ex)) {
-                                state.value_ptr.failures = 0;
+                                if (state.value_ptr.half_open) {
+                                    state.value_ptr.half_open_successes += 1;
+                                    if (state.value_ptr.half_open_successes >= cb.success_threshold) {
+                                        // Close circuit
+                                        state.value_ptr.failures = 0;
+                                        state.value_ptr.half_open = false;
+                                        state.value_ptr.half_open_successes = 0;
+                                    }
+                                } else {
+                                    state.value_ptr.failures = 0;
+                                }
                             } else |err| {
-                                state.value_ptr.failures += 1;
-                                if (state.value_ptr.failures >= cb.failure_threshold) {
+                                if (state.value_ptr.half_open) {
+                                    // Failed in half-open — reopen immediately
+                                    state.value_ptr.half_open = false;
                                     state.value_ptr.open_until_ms = now + @as(u64, cb.reset_ms);
+                                } else {
+                                    state.value_ptr.failures += 1;
+                                    if (state.value_ptr.failures >= cb.failure_threshold) {
+                                        state.value_ptr.open_until_ms = now + @as(u64, cb.reset_ms);
+                                    }
                                 }
                                 return err;
                             }
@@ -343,6 +422,14 @@ pub const SyncExecutor = struct {
                 },
 
                 .Transform => |t| try t.call(ex),
+
+                .DynamicRouter => |dr| {
+                    if (ex.getHeader(dr.header)) |uri| {
+                        const reg = self.registry orelse return error.RegistryRequired;
+                        const ep = try reg.resolve(ex.allocator, uri);
+                        try self.sendTo(.{ .endpoint = ep }, ex);
+                    }
+                },
             }
 
             // Message history tracking
@@ -428,6 +515,7 @@ pub const SyncExecutor = struct {
             .RoutingSlip => "RoutingSlip",
             .LoadBalancer => "LoadBalancer",
             .Transform => "Transform",
+            .DynamicRouter => "DynamicRouter",
         };
     }
 

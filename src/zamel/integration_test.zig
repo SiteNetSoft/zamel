@@ -2804,3 +2804,332 @@ test "transform modifies body" {
 
     try std.testing.expectEqualStrings("HELLO", ex.body);
 }
+
+// ======== Dynamic Router ========
+
+test "dynamic router routes by header value" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var mock_store = zamel.MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+    registry.setMockStore(&mock_store);
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try r.dynamicRouter("destination")).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("routed-msg");
+    try ex.putHeader("destination", "mock:dynamic-dest");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    exec.registry = &registry;
+    try exec.run(&r.plan, 0, &ex);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("dynamic-dest"));
+}
+
+test "dynamic router no-op when header missing" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    _ = try (try (try r.dynamicRouter("destination")).process(Processor.fromFn(uppercaseProcessor, null))).build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    exec.registry = &registry;
+    try exec.run(&r.plan, 0, &ex);
+
+    // Dynamic router was no-op but subsequent process step still ran
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// ======== Circuit Breaker Half-Open ========
+
+var fixed_clock_val: u64 = 0;
+
+fn fixedClock(_: ?*anyopaque) u64 {
+    return fixed_clock_val;
+}
+
+fn fixedClockServices(alloc: std.mem.Allocator) Services {
+    return .{
+        .allocator = alloc,
+        .clock = .{ .nowMillisFn = fixedClock, .ctx = null },
+    };
+}
+
+test "circuit breaker half-open probe" {
+    const alloc = std.testing.allocator;
+    fixed_clock_val = 0;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(alwaysFailProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .CircuitBreaker = .{ .failure_threshold = 1, .reset_ms = 1000 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var exec = SyncExecutor.init(fixedClockServices(alloc));
+    defer exec.deinit();
+
+    // First failure at t=0: opens circuit, open_until_ms=1000
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&plan, main_rid, &ex));
+    }
+
+    // Circuit is open at t=0 (0 < 1000)
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.CircuitOpen, exec.run(&plan, main_rid, &ex));
+    }
+
+    // Advance clock past reset period -> half-open
+    fixed_clock_val = 2000;
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        // Should allow probe in half-open, but still fails
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&plan, main_rid, &ex));
+    }
+
+    // Should be back to open after half-open failure (open_until=2000+1000=3000)
+    // Still at t=2000, so 2000 < 3000 → CircuitOpen
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.CircuitOpen, exec.run(&plan, main_rid, &ex));
+    }
+}
+
+test "circuit breaker success threshold" {
+    const alloc = std.testing.allocator;
+    fixed_clock_val = 0;
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // A processor that fails based on global counter
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(conditionalFailProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .CircuitBreaker = .{ .failure_threshold = 1, .reset_ms = 1000, .success_threshold = 2 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var exec = SyncExecutor.init(fixedClockServices(alloc));
+    defer exec.deinit();
+
+    // Fail to open circuit at t=0
+    conditional_fail = true;
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&plan, main_rid, &ex));
+    }
+
+    // Advance past reset
+    fixed_clock_val = 2000;
+    conditional_fail = false;
+
+    // First success in half-open — not enough to close (need 2)
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try exec.run(&plan, main_rid, &ex);
+    }
+
+    // Second success — should close circuit
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try exec.run(&plan, main_rid, &ex);
+    }
+
+    // Circuit should be closed now — can handle failures again normally
+    conditional_fail = true;
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&plan, main_rid, &ex));
+    }
+}
+
+var conditional_fail: bool = false;
+
+fn conditionalFailProcessor(_: ?*anyopaque, _: *Exchange) !void {
+    if (conditional_fail) return error.ProcessorFailed;
+}
+
+// ======== Dead Letter with Retry ========
+
+test "dead letter with retry" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    dl_captured_len = 0;
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(alwaysFailProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    const dl_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .DeadLetter = .{ .endpoint = .{ .endpoint = dl_ep }, .retries = 2, .retry_backoff_ms = 0 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("retry-then-dl");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    // Should have sent to dead letter after retries exhausted
+    try std.testing.expectEqualStrings("retry-then-dl", dl_captured_body[0..dl_captured_len]);
+}
+
+test "dead letter enriches error headers" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    dl_captured_len = 0;
+
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(alwaysFailProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    const dl_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .DeadLetter = .{ .endpoint = .{ .endpoint = dl_ep } } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("error-enriched");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    // CamelExceptionMessage should be set
+    try std.testing.expect(ex.getHeader("CamelExceptionMessage") != null);
+    try std.testing.expectEqualStrings("ProcessorFailed", ex.getHeader("CamelExceptionMessage").?);
+    try std.testing.expect(ex.getHeader("CamelExceptionTimestamp") != null);
+    try std.testing.expect(ex.getHeader("CamelFailedRouteId") != null);
+}
+
+// ======== Dead Letter with Retry via Builder ========
+
+test "deadLetterWithRetry builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    dl_captured_len = 0;
+
+    const dl_ep: zamel.Endpoint = .{
+        .ctx = null,
+        .createProducerFn = dlCaptureCreateProducer,
+    };
+
+    var pol = r.deadLetterWithRetry(dl_ep, 1, 0);
+    _ = try (try pol.process(Processor.fromFn(alwaysFailProcessor, null))).endPolicy();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("builder-dl-retry");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("builder-dl-retry", dl_captured_body[0..dl_captured_len]);
+}
+
+// ======== Circuit Breaker Advanced via Builder ========
+
+test "circuitBreakerAdvanced builder DSL" {
+    const alloc = std.testing.allocator;
+    fixed_clock_val = 0;
+    const services = fixedClockServices(alloc);
+
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var pol = try r.circuitBreakerAdvanced(1, 50000, 2);
+    _ = try (try pol.process(Processor.fromFn(alwaysFailProcessor, null))).endPolicy();
+
+    const rid = try r.build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // Should fail and open circuit at t=0
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.ProcessorFailed, exec.run(&r.plan, rid, &ex));
+    }
+
+    // Circuit should be open (0 < 50000)
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try std.testing.expectError(error.CircuitOpen, exec.run(&r.plan, rid, &ex));
+    }
+}

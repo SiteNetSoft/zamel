@@ -179,6 +179,32 @@ pub const RtBuilder = struct {
         return PolicyBuilder.init(self, .{ .CircuitBreaker = .{ .failure_threshold = failure_threshold, .reset_ms = reset_ms } });
     }
 
+    pub fn deadLetterWithRetry(self: *RtBuilder, ep: Endpoint, retries: u32, backoff_ms: u32) PolicyBuilder {
+        return PolicyBuilder.init(self, .{ .DeadLetter = .{
+            .endpoint = .{ .endpoint = ep },
+            .retries = retries,
+            .retry_backoff_ms = backoff_ms,
+        } });
+    }
+
+    pub fn deadLetterUriWithRetry(self: *RtBuilder, uri: []const u8, retries: u32, backoff_ms: u32) !PolicyBuilder {
+        const ep = try self.registry.resolve(self.arena.allocator(), uri);
+        return PolicyBuilder.init(self, .{ .DeadLetter = .{
+            .endpoint = .{ .endpoint = ep },
+            .retries = retries,
+            .retry_backoff_ms = backoff_ms,
+        } });
+    }
+
+    pub fn circuitBreakerAdvanced(self: *RtBuilder, failure_threshold: u32, reset_ms: u32, success_threshold: u32) !PolicyBuilder {
+        if (failure_threshold == 0) return error.InvalidPolicyConfig;
+        return PolicyBuilder.init(self, .{ .CircuitBreaker = .{
+            .failure_threshold = failure_threshold,
+            .reset_ms = reset_ms,
+            .success_threshold = success_threshold,
+        } });
+    }
+
     // ---- idempotent DSL ----
 
     pub fn idempotent(self: *RtBuilder, key_header: []const u8) IdempotentBuilder {
@@ -258,6 +284,13 @@ pub const RtBuilder = struct {
 
     pub fn routingSlip(self: *RtBuilder, header: []const u8) !*RtBuilder {
         try self.cur_steps.append(self.arena.allocator(), .{ .RoutingSlip = .{ .header = header } });
+        return self;
+    }
+
+    // ---- dynamic router ----
+
+    pub fn dynamicRouter(self: *RtBuilder, header: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .DynamicRouter = .{ .header = header } });
         return self;
     }
 

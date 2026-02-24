@@ -103,6 +103,117 @@ fn headerContainsCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
     return std.mem.indexOf(u8, val, c.needle) != null;
 }
 
+// -------- glob matching --------
+
+/// Glob match helper: supports '*' (any sequence) and '?' (any single char).
+pub fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var pi: usize = 0;
+    var ti: usize = 0;
+    var star_pi: usize = pattern.len; // invalid sentinel
+    var star_ti: usize = 0;
+
+    while (ti < text.len) {
+        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if (pi < pattern.len and pattern[pi] == '*') {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (star_pi < pattern.len) {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    // Consume trailing stars
+    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+    return pi == pattern.len;
+}
+
+// -------- glob-based predicates --------
+
+/// Predicate: header value matches glob pattern
+pub fn headerMatches(allocator: std.mem.Allocator, key: []const u8, pattern: []const u8) !Predicate {
+    const Ctx = struct { key: []const u8, pattern: []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .key = key, .pattern = pattern };
+    return Predicate.fromFn(headerMatchesCall, p);
+}
+
+fn headerMatchesCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { key: []const u8, pattern: []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    const val = ex.getHeader(c.key) orelse return false;
+    return globMatch(c.pattern, val);
+}
+
+/// Predicate: numeric header value > threshold
+pub fn headerGt(allocator: std.mem.Allocator, key: []const u8, threshold: i64) !Predicate {
+    const Ctx = struct { key: []const u8, threshold: i64 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .key = key, .threshold = threshold };
+    return Predicate.fromFn(headerGtCall, p);
+}
+
+fn headerGtCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { key: []const u8, threshold: i64 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    const val = ex.getHeader(c.key) orelse return false;
+    const num = std.fmt.parseInt(i64, val, 10) catch return false;
+    return num > c.threshold;
+}
+
+/// Predicate: numeric header value < threshold
+pub fn headerLt(allocator: std.mem.Allocator, key: []const u8, threshold: i64) !Predicate {
+    const Ctx = struct { key: []const u8, threshold: i64 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .key = key, .threshold = threshold };
+    return Predicate.fromFn(headerLtCall, p);
+}
+
+fn headerLtCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { key: []const u8, threshold: i64 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    const val = ex.getHeader(c.key) orelse return false;
+    const num = std.fmt.parseInt(i64, val, 10) catch return false;
+    return num < c.threshold;
+}
+
+/// Predicate: body matches glob pattern
+pub fn bodyMatches(allocator: std.mem.Allocator, pattern: []const u8) !Predicate {
+    const Ctx = struct { pattern: []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .pattern = pattern };
+    return Predicate.fromFn(bodyMatchesCall, p);
+}
+
+fn bodyMatchesCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { pattern: []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    return globMatch(c.pattern, ex.body);
+}
+
+/// Predicate: all header key=value pairs must match
+pub fn allHeadersEq(allocator: std.mem.Allocator, keys: []const []const u8, values: []const []const u8) !Predicate {
+    const Ctx = struct { keys: []const []const u8, values: []const []const u8 };
+    const p = try allocator.create(Ctx);
+    p.* = .{ .keys = keys, .values = values };
+    return Predicate.fromFn(allHeadersEqCall, p);
+}
+
+fn allHeadersEqCall(ctx: ?*anyopaque, ex: *Exchange) !bool {
+    const Ctx = struct { keys: []const []const u8, values: []const []const u8 };
+    const c: *const Ctx = @ptrCast(@alignCast(ctx.?));
+    for (c.keys, c.values) |key, value| {
+        const got = ex.getHeader(key) orelse return false;
+        if (!std.mem.eql(u8, got, value)) return false;
+    }
+    return true;
+}
+
 // -------- combinators --------
 
 /// Predicate: NOT inner
@@ -349,4 +460,117 @@ test "headerContains matches substring in header value" {
 
     const pred3 = try headerContains(alloc, "Missing", "any");
     try std.testing.expect(!(try pred3.call(&ex)));
+}
+
+test "globMatch helper edge cases" {
+    try std.testing.expect(globMatch("*", "anything"));
+    try std.testing.expect(globMatch("*", ""));
+    try std.testing.expect(globMatch("hello", "hello"));
+    try std.testing.expect(!globMatch("hello", "world"));
+    try std.testing.expect(globMatch("h?llo", "hello"));
+    try std.testing.expect(!globMatch("h?llo", "hllo"));
+    try std.testing.expect(globMatch("*.json", "data.json"));
+    try std.testing.expect(!globMatch("*.json", "data.xml"));
+    try std.testing.expect(globMatch("test*end", "test123end"));
+    try std.testing.expect(globMatch("test*end", "testend"));
+    try std.testing.expect(!globMatch("test*end", "test123enx"));
+    try std.testing.expect(globMatch("**", "abc"));
+    try std.testing.expect(globMatch("a*b*c", "aXbYc"));
+    try std.testing.expect(globMatch("", ""));
+    try std.testing.expect(!globMatch("", "x"));
+}
+
+test "headerMatches glob predicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("file", "report.json");
+
+    const pred = try headerMatches(alloc, "file", "*.json");
+    try std.testing.expect(try pred.call(&ex));
+
+    const pred2 = try headerMatches(alloc, "file", "*.xml");
+    try std.testing.expect(!(try pred2.call(&ex)));
+
+    const pred3 = try headerMatches(alloc, "missing", "*");
+    try std.testing.expect(!(try pred3.call(&ex)));
+}
+
+test "headerGt/Lt numeric comparison" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("age", "25");
+
+    const gt20 = try headerGt(alloc, "age", 20);
+    try std.testing.expect(try gt20.call(&ex));
+
+    const gt30 = try headerGt(alloc, "age", 30);
+    try std.testing.expect(!(try gt30.call(&ex)));
+
+    const lt30 = try headerLt(alloc, "age", 30);
+    try std.testing.expect(try lt30.call(&ex));
+
+    const lt20 = try headerLt(alloc, "age", 20);
+    try std.testing.expect(!(try lt20.call(&ex)));
+
+    // Non-numeric header returns false
+    try ex.putHeader("name", "alice");
+    const gt0 = try headerGt(alloc, "name", 0);
+    try std.testing.expect(!(try gt0.call(&ex)));
+
+    // Missing header returns false
+    const gt_miss = try headerGt(alloc, "missing", 0);
+    try std.testing.expect(!(try gt_miss.call(&ex)));
+}
+
+test "bodyMatches glob" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.setBody("Hello World!");
+
+    const pred = try bodyMatches(alloc, "Hello*");
+    try std.testing.expect(try pred.call(&ex));
+
+    const pred2 = try bodyMatches(alloc, "*World!");
+    try std.testing.expect(try pred2.call(&ex));
+
+    const pred3 = try bodyMatches(alloc, "Goodbye*");
+    try std.testing.expect(!(try pred3.call(&ex)));
+}
+
+test "allHeadersEq multi-field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var ex = Exchange.init(std.testing.allocator);
+    defer ex.deinit();
+    try ex.putHeader("type", "order");
+    try ex.putHeader("status", "new");
+
+    const keys = &[_][]const u8{ "type", "status" };
+    const values = &[_][]const u8{ "order", "new" };
+    const pred = try allHeadersEq(alloc, keys, values);
+    try std.testing.expect(try pred.call(&ex));
+
+    // Change one header — should fail
+    try ex.putHeader("status", "old");
+    try std.testing.expect(!(try pred.call(&ex)));
+
+    // Missing header — should fail
+    const keys2 = &[_][]const u8{ "type", "missing" };
+    const values2 = &[_][]const u8{ "order", "x" };
+    const pred2 = try allHeadersEq(alloc, keys2, values2);
+    try std.testing.expect(!(try pred2.call(&ex)));
 }

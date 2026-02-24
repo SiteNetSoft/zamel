@@ -43,10 +43,17 @@ pub const time_util = @import("time_util.zig");
 pub const mock = @import("mock.zig");
 pub const SedaQueue = @import("seda.zig").SedaQueue;
 
+pub const Channel = @import("channel.zig").Channel;
+pub const ChannelMessage = @import("channel.zig").ChannelMessage;
+pub const AsyncExecutor = @import("executor_async.zig").AsyncExecutor;
+
 test {
     _ = @import("integration_test.zig");
     _ = @import("bean.zig");
     _ = @import("marshal.zig");
     _ = @import("metrics.zig");
     _ = @import("executor_threaded.zig");
+    _ = @import("tcp.zig");
+    _ = @import("channel.zig");
+    _ = @import("executor_async.zig");
 }
