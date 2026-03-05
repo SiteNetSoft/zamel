@@ -60,7 +60,8 @@ fn httpSend(ctx: ?*anyopaque, ex: *Exchange) !void {
     const stream: posix.fd_t = @intCast(sock_rc);
     defer posix.close(stream);
 
-    try posix.connect(stream, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    const connect_rc = posix.system.connect(stream, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    if (posix.errno(connect_rc) != .SUCCESS) return error.ConnectFailed;
 
     // Send request line + headers
     try sendAll(stream, req_line);

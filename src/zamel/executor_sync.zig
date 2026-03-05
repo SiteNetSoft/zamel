@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("sync.zig");
 const Exchange = @import("exchange.zig").Exchange;
 const Services = @import("services.zig").Services;
 const RoutePlan = @import("plan.zig").RoutePlan;
@@ -110,33 +111,56 @@ pub const SyncExecutor = struct {
                 },
 
                 .Aggregate => |a| {
-                    // Split body by separator, run sub-route on each part,
-                    // then join the resulting bodies back with separator
-                    var parts: std.ArrayList([]u8) = .empty;
-                    defer {
-                        for (parts.items) |p| ex.allocator.free(p);
-                        parts.deinit(ex.allocator);
+                    if (a.strategy) |strat| {
+                        // Custom strategy: fold iteratively
+                        var accumulated: []u8 = &[_]u8{};
+                        defer if (accumulated.len != 0) ex.allocator.free(accumulated);
+
+                        var it = std.mem.splitSequence(u8, ex.body, a.separator);
+                        while (it.next()) |part| {
+                            var child = Exchange.init(ex.allocator);
+                            defer child.deinit();
+                            try child.setBody(part);
+
+                            var hit = ex.headers.iterator();
+                            while (hit.next()) |e| try child.putHeader(e.key_ptr.*, e.value_ptr.*);
+
+                            try self.run(plan, a.route, &child);
+
+                            const new_acc = try strat.call(accumulated, child.body, ex.allocator);
+                            if (accumulated.len != 0) ex.allocator.free(accumulated);
+                            accumulated = new_acc;
+                        }
+
+                        if (ex.body.len != 0) ex.allocator.free(ex.body);
+                        ex.body = accumulated;
+                        accumulated = &[_]u8{}; // prevent defer from freeing
+                    } else {
+                        // Default: split, run sub-route, join back with separator
+                        var parts: std.ArrayList([]u8) = .empty;
+                        defer {
+                            for (parts.items) |p| ex.allocator.free(p);
+                            parts.deinit(ex.allocator);
+                        }
+
+                        var it = std.mem.splitSequence(u8, ex.body, a.separator);
+                        while (it.next()) |part| {
+                            var child = Exchange.init(ex.allocator);
+                            defer child.deinit();
+                            try child.setBody(part);
+
+                            var hit = ex.headers.iterator();
+                            while (hit.next()) |e| try child.putHeader(e.key_ptr.*, e.value_ptr.*);
+
+                            try self.run(plan, a.route, &child);
+
+                            try parts.append(ex.allocator, try ex.allocator.dupe(u8, child.body));
+                        }
+
+                        const joined = try std.mem.join(ex.allocator, a.separator, parts.items);
+                        if (ex.body.len != 0) ex.allocator.free(ex.body);
+                        ex.body = joined;
                     }
-
-                    var it = std.mem.splitSequence(u8, ex.body, a.separator);
-                    while (it.next()) |part| {
-                        var child = Exchange.init(ex.allocator);
-                        defer child.deinit();
-                        try child.setBody(part);
-
-                        var hit = ex.headers.iterator();
-                        while (hit.next()) |e| try child.putHeader(e.key_ptr.*, e.value_ptr.*);
-
-                        try self.run(plan, a.route, &child);
-
-                        // Collect the result
-                        try parts.append(ex.allocator, try ex.allocator.dupe(u8, child.body));
-                    }
-
-                    // Join results back into parent body
-                    const joined = try std.mem.join(ex.allocator, a.separator, parts.items);
-                    if (ex.body.len != 0) ex.allocator.free(ex.body);
-                    ex.body = joined;
                 },
 
                 .WireTap => |eref| {
@@ -166,11 +190,23 @@ pub const SyncExecutor = struct {
                     // Check if already seen
                     if (try store.get(ex.allocator, key_val)) |existing| {
                         ex.allocator.free(existing);
-                        // Duplicate — skip
+                        // Duplicate detected
+                        try ex.putHeader("CamelDuplicateMessage", "true");
+                        if (!ic.skip_duplicate) {
+                            // Non-skip mode: run route anyway with duplicate header set
+                            try self.run(plan, ic.route, ex);
+                        }
                     } else {
-                        // First time — store and execute
-                        try store.put(key_val, "1");
-                        try self.run(plan, ic.route, ex);
+                        // First time
+                        if (ic.eager) {
+                            // Eager: store key before execution
+                            try store.put(key_val, "1");
+                            try self.run(plan, ic.route, ex);
+                        } else {
+                            // Non-eager: store key after successful execution
+                            try self.run(plan, ic.route, ex);
+                            try store.put(key_val, "1");
+                        }
                     }
                 },
 
@@ -265,7 +301,7 @@ pub const SyncExecutor = struct {
                                 route_id: RouteId,
                                 ex_ptr: *Exchange,
                                 result: anyerror!void = {},
-                                done: std.Thread.ResetEvent = .unset,
+                                done: sync.Event = .{},
                             };
                             var tctx = Ctx{
                                 .executor = self,
@@ -370,6 +406,47 @@ pub const SyncExecutor = struct {
                                 }
                                 return err;
                             }
+                        },
+
+                        .Redelivery => |rd| {
+                            const total_attempts: u32 = rd.max_redeliveries + 1;
+                            var last_err: ?anyerror = null;
+                            var current_delay: u32 = rd.initial_delay_ms;
+
+                            for (0..total_attempts) |attempt| {
+                                if (attempt > 0) {
+                                    // Set redelivery headers
+                                    var cnt_buf: [16]u8 = undefined;
+                                    const cnt_str = std.fmt.bufPrint(&cnt_buf, "{d}", .{attempt}) catch "?";
+                                    try ex.putHeader("CamelRedeliveryCounter", cnt_str);
+                                    try ex.putHeader("CamelRedelivered", "true");
+                                    var max_buf: [16]u8 = undefined;
+                                    const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{rd.max_redeliveries}) catch "?";
+                                    try ex.putHeader("CamelRedeliveryMaxCounter", max_str);
+
+                                    if (current_delay > 0) {
+                                        @import("time_util.zig").sleepMs(@as(u64, current_delay));
+                                    }
+
+                                    // Compute next delay
+                                    if (rd.use_exponential) {
+                                        current_delay = if (current_delay == 0) rd.initial_delay_ms else current_delay *| 2;
+                                    } else {
+                                        current_delay = current_delay *| rd.multiplier;
+                                    }
+                                    if (rd.max_delay_ms > 0 and current_delay > rd.max_delay_ms) {
+                                        current_delay = rd.max_delay_ms;
+                                    }
+                                }
+
+                                if (self.run(plan, pol.route, ex)) {
+                                    last_err = null;
+                                    break;
+                                } else |err| {
+                                    last_err = err;
+                                }
+                            }
+                            if (last_err) |err| return err;
                         },
                     }
                 },
@@ -520,9 +597,14 @@ pub const SyncExecutor = struct {
     }
 
     fn sendTo(self: *SyncExecutor, eref: EndpointRef, ex: *Exchange) !void {
-        _ = self;
         switch (eref) {
             .endpoint => |ep| {
+                const prod = try ep.createProducer(ex.allocator);
+                try prod.send(ex);
+            },
+            .uri => |uri| {
+                const reg = self.registry orelse return error.RegistryNotSet;
+                const ep = try reg.resolve(ex.allocator, uri);
                 const prod = try ep.createProducer(ex.allocator);
                 try prod.send(ex);
             },
@@ -744,4 +826,250 @@ test "Aggregate transforms and rejoins body" {
 
     // Each part should have X appended, then rejoined
     try std.testing.expectEqualStrings("aaaX\nbbbX\ncccX", ex.body);
+}
+
+test "Aggregate with custom strategy (join with comma)" {
+    const alloc = std.testing.allocator;
+    const aggregation = @import("aggregation.zig");
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    const strat = try aggregation.joinStrategy(alloc, ",");
+    defer alloc.destroy(@as(*const struct { sep: []const u8 }, @ptrCast(@alignCast(strat.ctx.?))));
+
+    var main_steps = [_]Step{.{ .Aggregate = .{ .separator = "\n", .route = sub_rid, .strategy = strat } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("aaa\nbbb\nccc");
+
+    var exec = SyncExecutor.init(testServices());
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    // Custom strategy joins with comma instead of original separator
+    try std.testing.expectEqualStrings("aaaX,bbbX,cccX", ex.body);
+}
+
+test "Aggregate with last strategy keeps only final part" {
+    const alloc = std.testing.allocator;
+    const aggregation = @import("aggregation.zig");
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .Aggregate = .{ .separator = "\n", .route = sub_rid, .strategy = aggregation.lastStrategy() } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("aaa\nbbb\nccc");
+
+    var exec = SyncExecutor.init(testServices());
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    try std.testing.expectEqualStrings("cccX", ex.body);
+}
+
+var redelivery_fail_count: u32 = 0;
+
+fn redeliveryFailingProcessor(_: ?*anyopaque, _: *Exchange) !void {
+    if (redelivery_fail_count > 0) {
+        redelivery_fail_count -= 1;
+        return error.TransientFailure;
+    }
+}
+
+test "Redelivery succeeds after transient failures" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    redelivery_fail_count = 2;
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(redeliveryFailingProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .Redelivery = .{ .max_redeliveries = 3, .initial_delay_ms = 0 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(testServices());
+    defer exec.deinit();
+    try exec.run(&plan, main_rid, &ex);
+
+    try std.testing.expectEqual(@as(u32, 0), redelivery_fail_count);
+    // Should have redelivery headers set
+    try std.testing.expectEqualStrings("true", ex.getHeader("CamelRedelivered").?);
+    try std.testing.expectEqualStrings("2", ex.getHeader("CamelRedeliveryCounter").?);
+    try std.testing.expectEqualStrings("3", ex.getHeader("CamelRedeliveryMaxCounter").?);
+}
+
+test "Redelivery exhausted returns error" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    redelivery_fail_count = 100;
+    var inner_steps = [_]Step{.{ .Process = Processor.fromFn(redeliveryFailingProcessor, null) }};
+    const inner_rid = try plan.addRoute(alloc, &inner_steps);
+
+    var main_steps = [_]Step{.{ .Policy = .{
+        .kind = .{ .Redelivery = .{ .max_redeliveries = 2, .initial_delay_ms = 0 } },
+        .route = inner_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+
+    var exec = SyncExecutor.init(testServices());
+    defer exec.deinit();
+    const result = exec.run(&plan, main_rid, &ex);
+    try std.testing.expectError(error.TransientFailure, result);
+}
+
+test "IdempotentConsumer sets duplicate header" {
+    const alloc = std.testing.allocator;
+    const InMemoryStore = @import("state_store.zig").InMemoryStore;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .IdempotentConsumer = .{
+        .key_header = "MessageId",
+        .route = sub_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+    var services = testServices();
+    services.store = store.stateStore();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First run
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hi");
+        try ex.putHeader("MessageId", "msg-1");
+        try exec.run(&plan, main_rid, &ex);
+        try std.testing.expectEqualStrings("hiX", ex.body);
+        try std.testing.expect(ex.getHeader("CamelDuplicateMessage") == null);
+    }
+
+    // Second run (duplicate) — skipped, but header set
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hi");
+        try ex.putHeader("MessageId", "msg-1");
+        try exec.run(&plan, main_rid, &ex);
+        try std.testing.expectEqualStrings("hi", ex.body); // not processed
+        try std.testing.expectEqualStrings("true", ex.getHeader("CamelDuplicateMessage").?);
+    }
+}
+
+test "IdempotentConsumer non-skip mode runs route on duplicate" {
+    const alloc = std.testing.allocator;
+    const InMemoryStore = @import("state_store.zig").InMemoryStore;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .IdempotentConsumer = .{
+        .key_header = "MessageId",
+        .route = sub_rid,
+        .skip_duplicate = false,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+    var services = testServices();
+    services.store = store.stateStore();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First run
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hi");
+        try ex.putHeader("MessageId", "msg-1");
+        try exec.run(&plan, main_rid, &ex);
+        try std.testing.expectEqualStrings("hiX", ex.body);
+    }
+
+    // Second run (duplicate) — still processed in non-skip mode
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hi");
+        try ex.putHeader("MessageId", "msg-1");
+        try exec.run(&plan, main_rid, &ex);
+        try std.testing.expectEqualStrings("hiX", ex.body); // processed!
+        try std.testing.expectEqualStrings("true", ex.getHeader("CamelDuplicateMessage").?);
+    }
+}
+
+test "IdempotentConsumer non-eager stores after execution" {
+    const alloc = std.testing.allocator;
+    const InMemoryStore = @import("state_store.zig").InMemoryStore;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .IdempotentConsumer = .{
+        .key_header = "MessageId",
+        .route = sub_rid,
+        .eager = false,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var store = InMemoryStore.init(alloc);
+    defer store.deinit();
+    var services = testServices();
+    services.store = store.stateStore();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First run — should execute and then store
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hi");
+        try ex.putHeader("MessageId", "msg-1");
+        try exec.run(&plan, main_rid, &ex);
+        try std.testing.expectEqualStrings("hiX", ex.body);
+    }
+
+    // Key should now be stored
+    if (try store.stateStore().get(alloc, "msg-1")) |val| {
+        alloc.free(val);
+    } else {
+        return error.TestFailed;
+    }
 }

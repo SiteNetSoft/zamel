@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("sync.zig");
 const Exchange = @import("exchange.zig").Exchange;
 const Services = @import("services.zig").Services;
 const RoutePlan = @import("plan.zig").RoutePlan;
@@ -10,7 +11,7 @@ const WorkItem = struct {
     route_id: RouteId,
     exchange: *Exchange,
     result: anyerror!void = {},
-    done: std.Thread.ResetEvent = .unset,
+    done: sync.Event = .{},
 };
 
 pub const AsyncHandle = struct {
@@ -32,8 +33,8 @@ pub const AsyncExecutor = struct {
 
     // Job queue protected by mutex
     queue: std.ArrayList(*WorkItem),
-    queue_mutex: std.Thread.Mutex,
-    queue_cond: std.Thread.Condition,
+    queue_mutex: sync.Mutex,
+    queue_cond: sync.Condition,
     shutdown: bool,
 
     pub fn init(services: Services, pool_size: usize) !AsyncExecutor {
@@ -218,4 +219,135 @@ test "async executor parallel multicast" {
 
     try std.testing.expectEqualStrings("aX", ex1.body);
     try std.testing.expectEqualStrings("bX", ex2.body);
+}
+
+fn failingAsyncProcessor(_: ?*anyopaque, _: *Exchange) !void {
+    return error.TestProcessorError;
+}
+
+test "async executor error propagation" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(failingAsyncProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var async_exec = try AsyncExecutor.init(testServices(), 2);
+    defer async_exec.deinit();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    const handle = try async_exec.submit(&plan, rid, &ex);
+    const result = handle.wait();
+    alloc.destroy(handle.item);
+
+    try std.testing.expectError(error.TestProcessorError, result);
+}
+
+test "async executor graceful shutdown with pending work" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var async_exec = try AsyncExecutor.init(testServices(), 2);
+    defer async_exec.deinit();
+
+    // Submit 4 jobs
+    var exchanges: [4]Exchange = undefined;
+    var handles: [4]AsyncHandle = undefined;
+    for (&exchanges, 0..) |*ex, i| {
+        ex.* = Exchange.init(alloc);
+        try ex.setBody("data");
+        handles[i] = try async_exec.submit(&plan, rid, ex);
+    }
+
+    // Wait on all
+    for (&handles) |*h| {
+        try h.wait();
+        alloc.destroy(h.item);
+    }
+
+    // Verify all processed
+    for (&exchanges) |*ex| {
+        try std.testing.expectEqualStrings("dataX", ex.body);
+        ex.deinit();
+    }
+}
+
+test "async executor multiple workers contention" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    // 4 workers, 8 jobs
+    var async_exec = try AsyncExecutor.init(testServices(), 4);
+    defer async_exec.deinit();
+
+    var exchanges: [8]Exchange = undefined;
+    var handles: [8]AsyncHandle = undefined;
+    for (&exchanges, 0..) |*ex, i| {
+        ex.* = Exchange.init(alloc);
+        try ex.setBody("x");
+        handles[i] = try async_exec.submit(&plan, rid, ex);
+    }
+
+    for (&handles) |*h| {
+        try h.wait();
+        alloc.destroy(h.item);
+    }
+
+    for (&exchanges) |*ex| {
+        try std.testing.expectEqualStrings("xX", ex.body);
+        ex.deinit();
+    }
+}
+
+test "async executor empty queue shutdown" {
+    const alloc = std.testing.allocator;
+    // Start executor, immediately deinit — no work submitted
+    var async_exec = try AsyncExecutor.init(testServices(), 2);
+    _ = alloc;
+    // deinit without any submissions should not hang
+    async_exec.deinit();
+}
+
+test "async executor sequential consistency" {
+    const alloc = std.testing.allocator;
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(appendProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    // Single worker to ensure sequential execution
+    var async_exec = try AsyncExecutor.init(testServices(), 1);
+    defer async_exec.deinit();
+
+    // Three sequential run() calls
+    var ex1 = Exchange.init(alloc);
+    defer ex1.deinit();
+    try ex1.setBody("a");
+    try async_exec.run(&plan, rid, &ex1);
+    try std.testing.expectEqualStrings("aX", ex1.body);
+
+    var ex2 = Exchange.init(alloc);
+    defer ex2.deinit();
+    try ex2.setBody("b");
+    try async_exec.run(&plan, rid, &ex2);
+    try std.testing.expectEqualStrings("bX", ex2.body);
+
+    var ex3 = Exchange.init(alloc);
+    defer ex3.deinit();
+    try ex3.setBody("c");
+    try async_exec.run(&plan, rid, &ex3);
+    try std.testing.expectEqualStrings("cX", ex3.body);
 }

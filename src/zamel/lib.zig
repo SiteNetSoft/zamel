@@ -30,6 +30,11 @@ pub const Registry = @import("registry.zig").Registry;
 pub const RouteState = @import("registry.zig").RouteState;
 pub const BeanFn = @import("registry.zig").BeanFn;
 pub const RtBuilder = @import("builder_rt.zig").RtBuilder;
+pub const CtBuilder = @import("builder_ct.zig").CtBuilder;
+pub const CtBranch = @import("builder_ct.zig").CtBranch;
+pub const ct_builder = @import("builder_ct.zig");
+pub const ct_pred = @import("ct_predicates.zig");
+pub const ct_proc = @import("ct_processors.zig");
 
 pub const LogLevel = @import("step.zig").LogLevel;
 pub const LoadBalancerStrategy = @import("step.zig").LoadBalancerStrategy;
@@ -43,6 +48,10 @@ pub const time_util = @import("time_util.zig");
 pub const mock = @import("mock.zig");
 pub const SedaQueue = @import("seda.zig").SedaQueue;
 
+pub const AggregationStrategy = @import("aggregation.zig").AggregationStrategy;
+pub const aggregation = @import("aggregation.zig");
+
+pub const sync = @import("sync.zig");
 pub const Channel = @import("channel.zig").Channel;
 pub const ChannelMessage = @import("channel.zig").ChannelMessage;
 pub const AsyncExecutor = @import("executor_async.zig").AsyncExecutor;
@@ -56,4 +65,9 @@ test {
     _ = @import("tcp.zig");
     _ = @import("channel.zig");
     _ = @import("executor_async.zig");
+    _ = @import("aggregation.zig");
+    _ = @import("unix.zig");
+    _ = @import("builder_ct.zig");
+    _ = @import("ct_predicates.zig");
+    _ = @import("ct_processors.zig");
 }

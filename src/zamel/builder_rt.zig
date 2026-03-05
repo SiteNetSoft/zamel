@@ -7,6 +7,7 @@ const DataFormat = @import("step.zig").DataFormat;
 const ClaimCheckAction = @import("step.zig").ClaimCheckAction;
 const LogLevel = @import("step.zig").LogLevel;
 const LoadBalancerStrategy = @import("step.zig").LoadBalancerStrategy;
+const AggregationStrategy = @import("aggregation.zig").AggregationStrategy;
 const RoutePlan = @import("plan.zig").RoutePlan;
 const RouteId = @import("step.zig").RouteId;
 
@@ -153,6 +154,10 @@ pub const RtBuilder = struct {
         return AggregateBuilder.init(self, separator);
     }
 
+    pub fn aggregateWith(self: *RtBuilder, separator: []const u8, strategy: AggregationStrategy) AggregateBuilder {
+        return AggregateBuilder.initWithStrategy(self, separator, strategy);
+    }
+
     // ---- policy DSL ----
 
     pub fn retry(self: *RtBuilder, max: u32, backoff_ms: u32) !PolicyBuilder {
@@ -205,10 +210,34 @@ pub const RtBuilder = struct {
         } });
     }
 
+    pub fn redelivery(self: *RtBuilder, max: u32, initial_delay_ms: u32) !PolicyBuilder {
+        if (max == 0) return error.InvalidPolicyConfig;
+        return PolicyBuilder.init(self, .{ .Redelivery = .{
+            .max_redeliveries = max,
+            .initial_delay_ms = initial_delay_ms,
+        } });
+    }
+
+    pub fn redeliveryExponential(self: *RtBuilder, max: u32, initial_delay_ms: u32, max_delay_ms: u32) !PolicyBuilder {
+        if (max == 0) return error.InvalidPolicyConfig;
+        return PolicyBuilder.init(self, .{ .Redelivery = .{
+            .max_redeliveries = max,
+            .initial_delay_ms = initial_delay_ms,
+            .max_delay_ms = max_delay_ms,
+            .use_exponential = true,
+        } });
+    }
+
     // ---- idempotent DSL ----
 
     pub fn idempotent(self: *RtBuilder, key_header: []const u8) IdempotentBuilder {
         return IdempotentBuilder.init(self, key_header);
+    }
+
+    pub fn idempotentNonEager(self: *RtBuilder, key_header: []const u8) IdempotentBuilder {
+        var ib = IdempotentBuilder.init(self, key_header);
+        ib.eager = false;
+        return ib;
     }
 
     // ---- doTry DSL ----
@@ -813,12 +842,22 @@ pub const SplitBuilder = struct {
 pub const AggregateBuilder = struct {
     parent: *RtBuilder,
     separator: []const u8,
+    strategy: ?AggregationStrategy = null,
     steps: std.ArrayList(Step),
 
     pub fn init(parent: *RtBuilder, separator: []const u8) AggregateBuilder {
         return .{
             .parent = parent,
             .separator = separator,
+            .steps = .empty,
+        };
+    }
+
+    pub fn initWithStrategy(parent: *RtBuilder, separator: []const u8, strategy: AggregationStrategy) AggregateBuilder {
+        return .{
+            .parent = parent,
+            .separator = separator,
+            .strategy = strategy,
             .steps = .empty,
         };
     }
@@ -919,6 +958,7 @@ pub const AggregateBuilder = struct {
         try self.parent.cur_steps.append(self.alloc(), .{ .Aggregate = .{
             .separator = self.separator,
             .route = rid,
+            .strategy = self.strategy,
         } });
         return self.parent;
     }
@@ -1063,6 +1103,8 @@ pub const MulticastBranchBuilder = struct {
 pub const IdempotentBuilder = struct {
     parent: *RtBuilder,
     key_header: []const u8,
+    skip_duplicate: bool = true,
+    eager: bool = true,
     steps: std.ArrayList(Step),
 
     pub fn init(parent: *RtBuilder, key_header: []const u8) IdempotentBuilder {
@@ -1071,6 +1113,11 @@ pub const IdempotentBuilder = struct {
             .key_header = key_header,
             .steps = .empty,
         };
+    }
+
+    pub fn skipDuplicate(self: *IdempotentBuilder, value: bool) *IdempotentBuilder {
+        self.skip_duplicate = value;
+        return self;
     }
 
     fn alloc(self: *IdempotentBuilder) std.mem.Allocator {
@@ -1159,6 +1206,8 @@ pub const IdempotentBuilder = struct {
         try self.parent.cur_steps.append(self.alloc(), .{ .IdempotentConsumer = .{
             .key_header = self.key_header,
             .route = rid,
+            .skip_duplicate = self.skip_duplicate,
+            .eager = self.eager,
         } });
         return self.parent;
     }

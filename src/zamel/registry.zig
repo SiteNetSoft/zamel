@@ -150,6 +150,8 @@ pub const Registry = struct {
             try self.resolveMockEndpoint(alloc, parsed.rest)
         else if (std.mem.eql(u8, parsed.scheme, "tcp"))
             try @import("tcp.zig").makeTcpEndpoint(alloc, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "unix"))
+            try @import("unix.zig").makeUnixEndpoint(alloc, parsed.rest)
         else if (self.endpoint_factories.get(parsed.scheme)) |factory|
             try factory(alloc, parsed.rest)
         else
@@ -204,6 +206,9 @@ pub const Registry = struct {
         }
         if (std.mem.eql(u8, parsed.scheme, "tcp")) {
             return try @import("tcp.zig").makeTcpConsumer(allocator, parsed.rest);
+        }
+        if (std.mem.eql(u8, parsed.scheme, "unix")) {
+            return try @import("unix.zig").makeUnixConsumer(allocator, parsed.rest);
         }
         if (self.consumer_factories.get(parsed.scheme)) |factory| {
             return try factory(allocator, parsed.rest);

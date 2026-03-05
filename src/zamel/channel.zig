@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("sync.zig");
 const Exchange = @import("exchange.zig").Exchange;
 
 pub const ChannelMessage = struct {
@@ -65,9 +66,9 @@ pub const Channel = struct {
     tail: usize,
     count: usize,
     closed: bool,
-    mutex: std.Thread.Mutex,
-    not_empty: std.Thread.Condition,
-    not_full: std.Thread.Condition,
+    mutex: sync.Mutex,
+    not_empty: sync.Condition,
+    not_full: sync.Condition,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Channel {

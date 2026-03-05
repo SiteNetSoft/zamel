@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const sync = @import("sync.zig");
 const Exchange = @import("exchange.zig").Exchange;
 const Endpoint = @import("endpoint.zig").Endpoint;
 const Producer = @import("endpoint.zig").Producer;
@@ -124,7 +125,8 @@ fn tcpSend(ctx: ?*anyopaque, ex: *Exchange) !void {
     const stream: posix.fd_t = @intCast(sock_rc);
     defer posix.close(stream);
 
-    try posix.connect(stream, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    const connect_rc = posix.system.connect(stream, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    if (posix.errno(connect_rc) != .SUCCESS) return error.ConnectFailed;
 
     // Send exchange body
     if (ex.body.len > 0) try sendAll(stream, ex.body);
@@ -306,7 +308,7 @@ test "tcp producer-consumer roundtrip" {
     const ServerCtx = struct {
         port: u16,
         allocator: std.mem.Allocator,
-        done: std.Thread.ResetEvent = .unset,
+        done: sync.Event = .{},
     };
     var server_ctx = ServerCtx{ .port = 0, .allocator = alloc };
 

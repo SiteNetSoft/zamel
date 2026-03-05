@@ -30,5 +30,5 @@ pub const Endpoint = struct {
 /// - lazy-resolved by registry
 pub const EndpointRef = union(enum) {
     endpoint: Endpoint,
-    // uri: []const u8, // optional: if you want to delay parsing/resolution
+    uri: []const u8,
 };

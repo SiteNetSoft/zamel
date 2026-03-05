@@ -4,6 +4,7 @@ const Processor = @import("processor.zig").Processor;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 const Splitter = @import("splitter.zig").Splitter;
 const RecipientResolver = @import("recipient_resolver.zig").RecipientResolver;
+const AggregationStrategy = @import("aggregation.zig").AggregationStrategy;
 
 pub const RouteId = u32;
 
@@ -39,6 +40,7 @@ pub const Step = union(enum) {
     Aggregate: struct {
         separator: []const u8 = "\n",
         route: RouteId,
+        strategy: ?AggregationStrategy = null,
     },
 
     // Fire-and-forget copy to a side endpoint:
@@ -58,6 +60,8 @@ pub const Step = union(enum) {
     IdempotentConsumer: struct {
         key_header: []const u8,
         route: RouteId,
+        skip_duplicate: bool = true, // false = run route but set header
+        eager: bool = true, // false = store key AFTER execution
     },
 
     // Content enricher: call endpoint, optionally merge result
@@ -144,5 +148,12 @@ pub const PolicyKind = union(enum) {
         failure_threshold: u32,
         reset_ms: u32,
         success_threshold: u32 = 1,
+    },
+    Redelivery: struct {
+        max_redeliveries: u32,
+        initial_delay_ms: u32 = 0,
+        multiplier: u32 = 1,
+        max_delay_ms: u32 = 0,
+        use_exponential: bool = false,
     },
 };
