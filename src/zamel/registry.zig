@@ -189,6 +189,11 @@ pub const Registry = struct {
             const cfg = try parseTimer(parsed.rest);
             return try consumers.timer(allocator, cfg.interval_ms, cfg.repeat);
         }
+        if (std.mem.eql(u8, parsed.scheme, "cron")) {
+            const cron = @import("cron.zig");
+            const cfg = try parseCronUri(parsed.rest);
+            return try cron.cronConsumer(allocator, cfg.expr, cfg.max_fires);
+        }
         if (std.mem.eql(u8, parsed.scheme, "file")) {
             return try consumers.fileReader(allocator, parsed.rest);
         }
@@ -374,4 +379,29 @@ fn writeAll(fd: posix.fd_t, data: []const u8) !void {
             else => return error.WriteFailed,
         }
     }
+}
+
+// -------- cron URI parsing --------
+// URI: "cron:expression" or "cron:expression?maxFires=N"
+
+const CronUriCfg = struct {
+    expr: @import("cron.zig").CronExpr,
+    max_fires: u64,
+};
+
+fn parseCronUri(rest: []const u8) !CronUriCfg {
+    var expr_part = rest;
+    var max_fires: u64 = 0;
+
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        expr_part = rest[0..q];
+        const query = rest[q + 1 ..];
+        if (std.mem.startsWith(u8, query, "maxFires=")) {
+            max_fires = try std.fmt.parseUnsigned(u64, query["maxFires=".len..], 10);
+        }
+    }
+
+    const cron = @import("cron.zig");
+    const expr = try cron.parseCron(expr_part);
+    return .{ .expr = expr, .max_fires = max_fires };
 }

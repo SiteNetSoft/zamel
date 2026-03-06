@@ -120,6 +120,26 @@ pub const Step = union(enum) {
     DynamicRouter: struct {
         header: []const u8,
     },
+
+    // Batch: collect N message bodies before processing as a group
+    Batch: struct {
+        size: u32,
+        separator: []const u8 = "\n",
+        route: RouteId,
+    },
+
+    // Request-reply: send to endpoint with correlation ID, use response as new body
+    RequestReply: struct {
+        endpoint: EndpointRef,
+        correlation_header: []const u8 = "CamelCorrelationId",
+    },
+
+    // Resequencer: buffer messages and reorder by sequence header
+    Resequencer: struct {
+        size: u32,
+        header: []const u8 = "CamelSequenceNumber",
+        route: RouteId,
+    },
 };
 
 pub const SplitKind = union(enum) {

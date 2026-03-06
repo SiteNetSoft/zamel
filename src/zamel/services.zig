@@ -36,6 +36,12 @@ pub const StateStore = struct {
 
 pub const Metrics = @import("metrics.zig").Metrics;
 
+pub const ErrorHandler = struct {
+    endpoint: @import("endpoint.zig").EndpointRef,
+    max_retries: u32 = 0,
+    retry_delay_ms: u32 = 0,
+};
+
 pub const Services = struct {
     allocator: std.mem.Allocator,
     clock: Clock,
@@ -43,4 +49,5 @@ pub const Services = struct {
     store: ?StateStore = null,
     metrics: ?Metrics = null,
     message_history: bool = false,
+    error_handler: ?ErrorHandler = null,
 };

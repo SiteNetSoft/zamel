@@ -126,6 +126,18 @@ pub fn CtBuilder(comptime num_steps: usize, comptime num_routes: usize) type {
             return self.appendStep(.{ .Enrich = .{ .endpoint = .{ .uri = uri }, .merge = merge } });
         }
 
+        pub fn requestReply(comptime self: Self, comptime ep: EndpointRef) CtBuilder(num_steps + 1, num_routes) {
+            return self.appendStep(.{ .RequestReply = .{ .endpoint = ep } });
+        }
+
+        pub fn requestReplyUri(comptime self: Self, comptime uri: []const u8) CtBuilder(num_steps + 1, num_routes) {
+            return self.appendStep(.{ .RequestReply = .{ .endpoint = .{ .uri = uri } } });
+        }
+
+        pub fn requestReplyWithHeader(comptime self: Self, comptime ep: EndpointRef, comptime correlation_header: []const u8) CtBuilder(num_steps + 1, num_routes) {
+            return self.appendStep(.{ .RequestReply = .{ .endpoint = ep, .correlation_header = correlation_header } });
+        }
+
         // ---- sub-route steps ----
 
         pub fn choiceOf(
@@ -267,11 +279,51 @@ pub fn CtBuilder(comptime num_steps: usize, comptime num_routes: usize) type {
             }.make);
         }
 
+        pub fn batchOf(comptime self: Self, comptime size: u32, comptime sub_steps: []const Step) CtBuilder(num_steps + 1, num_routes + 1) {
+            return self.addSubRouteStep(sub_steps, struct {
+                fn make(route_id: RouteId) Step {
+                    return .{ .Batch = .{ .size = size, .route = route_id } };
+                }
+            }.make);
+        }
+
+        pub fn batchWithSeparator(comptime self: Self, comptime size: u32, comptime separator: []const u8, comptime sub_steps: []const Step) CtBuilder(num_steps + 1, num_routes + 1) {
+            return self.addSubRouteStep(sub_steps, struct {
+                fn make(route_id: RouteId) Step {
+                    return .{ .Batch = .{ .size = size, .separator = separator, .route = route_id } };
+                }
+            }.make);
+        }
+
+        pub fn resequence(comptime self: Self, comptime size: u32, comptime sub_steps: []const Step) CtBuilder(num_steps + 1, num_routes + 1) {
+            return self.addSubRouteStep(sub_steps, struct {
+                fn make(route_id: RouteId) Step {
+                    return .{ .Resequencer = .{ .size = size, .route = route_id } };
+                }
+            }.make);
+        }
+
+        pub fn resequenceWithHeader(comptime self: Self, comptime size: u32, comptime header: []const u8, comptime sub_steps: []const Step) CtBuilder(num_steps + 1, num_routes + 1) {
+            return self.addSubRouteStep(sub_steps, struct {
+                fn make(route_id: RouteId) Step {
+                    return .{ .Resequencer = .{ .size = size, .header = header, .route = route_id } };
+                }
+            }.make);
+        }
+
         pub fn multicast(comptime self: Self, comptime branch_routes: []const []const Step) CtBuilder(num_steps + 1, num_routes + branch_routes.len) {
+            return self.multicastImpl(branch_routes, false);
+        }
+
+        pub fn parallelMulticast(comptime self: Self, comptime branch_routes: []const []const Step) CtBuilder(num_steps + 1, num_routes + branch_routes.len) {
+            return self.multicastImpl(branch_routes, true);
+        }
+
+        fn multicastImpl(comptime self: Self, comptime branch_routes: []const []const Step, comptime parallel: bool) CtBuilder(num_steps + 1, num_routes + branch_routes.len) {
             const new_routes = comptime buildMultiRoutes(num_routes, branch_routes.len, self.routes, branch_routes);
             const route_ids = comptime buildRouteIds(branch_routes.len, num_routes);
 
-            const step = Step{ .Multicast = .{ .routes = &route_ids } };
+            const step = Step{ .Multicast = .{ .routes = &route_ids, .parallel = parallel } };
 
             var new_steps: [num_steps + 1]Step = undefined;
             for (0..num_steps) |i| {

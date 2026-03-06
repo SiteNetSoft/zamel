@@ -106,6 +106,10 @@ pub const RtBuilder = struct {
         return MulticastBuilder.init(self);
     }
 
+    pub fn parallelMulticast(self: *RtBuilder) MulticastBuilder {
+        return MulticastBuilder.initParallel(self);
+    }
+
     // ---- wire tap ----
 
     pub fn wireTap(self: *RtBuilder, ep: EndpointRef) !*RtBuilder {
@@ -328,6 +332,46 @@ pub const RtBuilder = struct {
     pub fn transform(self: *RtBuilder, p: Processor) !*RtBuilder {
         try self.cur_steps.append(self.arena.allocator(), .{ .Transform = p });
         return self;
+    }
+
+    // ---- batch DSL ----
+
+    pub fn batch(self: *RtBuilder, size: u32) BatchBuilder {
+        return BatchBuilder.init(self, size, "\n");
+    }
+
+    pub fn batchWithSeparator(self: *RtBuilder, size: u32, separator: []const u8) BatchBuilder {
+        return BatchBuilder.init(self, size, separator);
+    }
+
+    // ---- request-reply ----
+
+    pub fn requestReply(self: *RtBuilder, ep: EndpointRef) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .RequestReply = .{ .endpoint = ep } });
+        return self;
+    }
+
+    pub fn requestReplyUri(self: *RtBuilder, uri: []const u8) !*RtBuilder {
+        const ep = try self.registry.resolve(self.arena.allocator(), uri);
+        return try self.requestReply(.{ .endpoint = ep });
+    }
+
+    pub fn requestReplyWithHeader(self: *RtBuilder, ep: EndpointRef, correlation_header: []const u8) !*RtBuilder {
+        try self.cur_steps.append(self.arena.allocator(), .{ .RequestReply = .{
+            .endpoint = ep,
+            .correlation_header = correlation_header,
+        } });
+        return self;
+    }
+
+    // ---- resequencer DSL ----
+
+    pub fn resequencer(self: *RtBuilder, size: u32) ResequencerBuilder {
+        return ResequencerBuilder.init(self, size, "CamelSequenceNumber");
+    }
+
+    pub fn resequencerWithHeader(self: *RtBuilder, size: u32, header: []const u8) ResequencerBuilder {
+        return ResequencerBuilder.init(self, size, header);
     }
 
     // ---- load balancer DSL ----
@@ -967,11 +1011,20 @@ pub const AggregateBuilder = struct {
 pub const MulticastBuilder = struct {
     parent: *RtBuilder,
     routes: std.ArrayList(RouteId),
+    parallel: bool = false,
 
     pub fn init(parent: *RtBuilder) MulticastBuilder {
         return .{
             .parent = parent,
             .routes = .empty,
+        };
+    }
+
+    pub fn initParallel(parent: *RtBuilder) MulticastBuilder {
+        return .{
+            .parent = parent,
+            .routes = .empty,
+            .parallel = true,
         };
     }
 
@@ -986,6 +1039,7 @@ pub const MulticastBuilder = struct {
     pub fn endMulticast(self: *MulticastBuilder) !*RtBuilder {
         try self.parent.cur_steps.append(self.alloc(), .{ .Multicast = .{
             .routes = self.routes.items,
+            .parallel = self.parallel,
         } });
         return self.parent;
     }
@@ -1574,5 +1628,151 @@ pub const LoadBalancerBranchBuilder = struct {
         const rid = try self.lb.parent.plan.addRoute(self.alloc(), self.steps.items);
         try self.lb.routes.append(self.alloc(), rid);
         return self.lb;
+    }
+};
+
+pub const BatchBuilder = struct {
+    parent: *RtBuilder,
+    size: u32,
+    separator: []const u8,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder, size: u32, separator: []const u8) BatchBuilder {
+        return .{
+            .parent = parent,
+            .size = size,
+            .separator = separator,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *BatchBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *BatchBuilder, p: Processor) !*BatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *BatchBuilder, pred: Predicate) !*BatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *BatchBuilder, ep: EndpointRef) !*BatchBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *BatchBuilder, uri: []const u8) !*BatchBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *BatchBuilder, value: []const u8) !*BatchBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *BatchBuilder, key: []const u8, value: []const u8) !*BatchBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn transform(self: *BatchBuilder, p: Processor) !*BatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
+    pub fn log(self: *BatchBuilder, message: []const u8) !*BatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn delay(self: *BatchBuilder, ms: u32) !*BatchBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn endBatch(self: *BatchBuilder) !*RtBuilder {
+        const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.parent.cur_steps.append(self.alloc(), .{ .Batch = .{
+            .size = self.size,
+            .separator = self.separator,
+            .route = rid,
+        } });
+        return self.parent;
+    }
+};
+
+pub const ResequencerBuilder = struct {
+    parent: *RtBuilder,
+    size: u32,
+    header: []const u8,
+    steps: std.ArrayList(Step),
+
+    pub fn init(parent: *RtBuilder, size: u32, header: []const u8) ResequencerBuilder {
+        return .{
+            .parent = parent,
+            .size = size,
+            .header = header,
+            .steps = .empty,
+        };
+    }
+
+    fn alloc(self: *ResequencerBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    pub fn process(self: *ResequencerBuilder, p: Processor) !*ResequencerBuilder {
+        try self.steps.append(self.alloc(), .{ .Process = p });
+        return self;
+    }
+
+    pub fn filter(self: *ResequencerBuilder, pred: Predicate) !*ResequencerBuilder {
+        try self.steps.append(self.alloc(), .{ .Filter = pred });
+        return self;
+    }
+
+    pub fn to(self: *ResequencerBuilder, ep: EndpointRef) !*ResequencerBuilder {
+        try self.steps.append(self.alloc(), .{ .To = ep });
+        return self;
+    }
+
+    pub fn toUri(self: *ResequencerBuilder, uri: []const u8) !*ResequencerBuilder {
+        const ep = try self.parent.registry.resolve(self.alloc(), uri);
+        return try self.to(.{ .endpoint = ep });
+    }
+
+    pub fn setBody(self: *ResequencerBuilder, value: []const u8) !*ResequencerBuilder {
+        return try self.process(try processors.setBody(self.alloc(), value));
+    }
+
+    pub fn setHeader(self: *ResequencerBuilder, key: []const u8, value: []const u8) !*ResequencerBuilder {
+        return try self.process(try processors.setHeader(self.alloc(), key, value));
+    }
+
+    pub fn transform(self: *ResequencerBuilder, p: Processor) !*ResequencerBuilder {
+        try self.steps.append(self.alloc(), .{ .Transform = p });
+        return self;
+    }
+
+    pub fn log(self: *ResequencerBuilder, message: []const u8) !*ResequencerBuilder {
+        try self.steps.append(self.alloc(), .{ .Log = .{ .message = message } });
+        return self;
+    }
+
+    pub fn delay(self: *ResequencerBuilder, ms: u32) !*ResequencerBuilder {
+        try self.steps.append(self.alloc(), .{ .Delay = .{ .ms = ms } });
+        return self;
+    }
+
+    pub fn endResequencer(self: *ResequencerBuilder) !*RtBuilder {
+        const rid = try self.parent.plan.addRoute(self.alloc(), self.steps.items);
+        try self.parent.cur_steps.append(self.alloc(), .{ .Resequencer = .{
+            .size = self.size,
+            .header = self.header,
+            .route = rid,
+        } });
+        return self.parent;
     }
 };

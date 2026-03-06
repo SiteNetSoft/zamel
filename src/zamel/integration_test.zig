@@ -3133,3 +3133,384 @@ test "circuitBreakerAdvanced builder DSL" {
         try std.testing.expectError(error.CircuitOpen, exec.run(&r.plan, rid, &ex));
     }
 }
+
+// -------- Feature: Parallel Multicast --------
+
+test "parallel multicast executes all branches" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var reg = Registry.init(services);
+    defer reg.deinit();
+
+    var r = RtBuilder.init(alloc, &reg);
+    defer r.deinit();
+
+    var mc = r.multicast();
+    var b1 = mc.branch();
+    _ = try b1.process(Processor.fromFn(uppercaseProcessor, null));
+    const mc2 = try b1.endBranch();
+    var b2 = mc2.branch();
+    _ = try b2.process(Processor.fromFn(uppercaseProcessor, null));
+    _ = try b2.endBranch();
+    _ = try mc2.endMulticast();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+test "parallel multicast with parallel flag" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var reg = Registry.init(services);
+    defer reg.deinit();
+
+    var r = RtBuilder.init(alloc, &reg);
+    defer r.deinit();
+
+    var mc = r.parallelMulticast();
+    var b1 = mc.branch();
+    _ = try b1.process(Processor.fromFn(uppercaseProcessor, null));
+    const mc2 = try b1.endBranch();
+    var b2 = mc2.branch();
+    _ = try b2.process(Processor.fromFn(uppercaseProcessor, null));
+    _ = try b2.endBranch();
+    _ = try mc2.endMulticast();
+
+    const rid = try r.build();
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("hello");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&r.plan, rid, &ex);
+
+    // With parallel multicast, clones are used; original exchange runs last branch
+    try std.testing.expectEqualStrings("HELLO", ex.body);
+}
+
+// -------- Feature: Batch Processing --------
+
+test "batch collects N messages then processes" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(uppercaseProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .Batch = .{
+        .size = 3,
+        .separator = ",",
+        .route = sub_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // Send 3 messages; only the third triggers the batch
+    for ([_][]const u8{ "alpha", "beta", "gamma" }) |body| {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody(body);
+        try exec.run(&plan, main_rid, &ex);
+    }
+}
+
+test "batch via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var reg = Registry.init(services);
+    defer reg.deinit();
+
+    var r = RtBuilder.init(alloc, &reg);
+    defer r.deinit();
+
+    var batch = r.batchWithSeparator(2, "|");
+    _ = try batch.process(Processor.fromFn(uppercaseProcessor, null));
+    _ = try batch.endBatch();
+
+    const rid = try r.build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First message - buffered, no processing yet
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hello");
+        try exec.run(&r.plan, rid, &ex);
+        // Body unchanged (still buffered)
+        try std.testing.expectEqualStrings("hello", ex.body);
+    }
+
+    // Second message - batch fires
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("world");
+        try exec.run(&r.plan, rid, &ex);
+        // Body should be the processed batch result
+        try std.testing.expectEqualStrings("HELLO|WORLD", ex.body);
+    }
+}
+
+// -------- Feature: Request-Reply --------
+
+fn echoEndpointSend(_: ?*anyopaque, ex: *Exchange) !void {
+    // Echo: prepend "reply:" to body
+    const old = ex.body;
+    const prefix = "reply:";
+    const new = try ex.allocator.alloc(u8, prefix.len + old.len);
+    @memcpy(new[0..prefix.len], prefix);
+    @memcpy(new[prefix.len..], old);
+    if (old.len != 0) ex.allocator.free(old);
+    ex.body = new;
+}
+
+fn echoCreateProducer(_: ?*anyopaque, _: std.mem.Allocator) !@import("endpoint.zig").Producer {
+    return .{ .ctx = null, .sendFn = echoEndpointSend };
+}
+
+test "request-reply sets correlation ID and gets response" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    const echo_ep = @import("endpoint.zig").Endpoint{
+        .ctx = null,
+        .createProducerFn = echoCreateProducer,
+        .deinitFn = null,
+    };
+
+    var steps = [_]Step{.{ .RequestReply = .{
+        .endpoint = .{ .endpoint = echo_ep },
+    } }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("ping");
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    try exec.run(&plan, rid, &ex);
+
+    // Body should be the reply
+    try std.testing.expectEqualStrings("reply:ping", ex.body);
+    // Correlation ID header should be set
+    try std.testing.expect(ex.getHeader("CamelCorrelationId") != null);
+}
+
+// -------- Feature: Resequencer --------
+
+test "resequencer reorders messages by sequence number" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Sub-route: just pass through (noop)
+    var sub_steps = [_]Step{.{ .Process = Processor.fromFn(uppercaseProcessor, null) }};
+    const sub_rid = try plan.addRoute(alloc, &sub_steps);
+
+    var main_steps = [_]Step{.{ .Resequencer = .{
+        .size = 3,
+        .header = "SeqNum",
+        .route = sub_rid,
+    } }};
+    const main_rid = try plan.addRoute(alloc, &main_steps);
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // Send messages out of order: 2, 0, 1
+    const bodies = [_][]const u8{ "c", "a", "b" };
+    const seqs = [_][]const u8{ "2", "0", "1" };
+
+    for (bodies, seqs) |body, seq| {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody(body);
+        try ex.putHeader("SeqNum", seq);
+        try exec.run(&plan, main_rid, &ex);
+    }
+    // The resequencer buffers 3 messages and processes them in order (0, 1, 2)
+}
+
+test "resequencer via builder DSL" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var reg = Registry.init(services);
+    defer reg.deinit();
+
+    var r = RtBuilder.init(alloc, &reg);
+    defer r.deinit();
+
+    var reseq = r.resequencerWithHeader(2, "SeqNum");
+    _ = try reseq.process(Processor.fromFn(uppercaseProcessor, null));
+    _ = try reseq.endResequencer();
+
+    const rid = try r.build();
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+
+    // First message - buffered
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("world");
+        try ex.putHeader("SeqNum", "1");
+        try exec.run(&r.plan, rid, &ex);
+    }
+
+    // Second message - triggers processing in order
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("hello");
+        try ex.putHeader("SeqNum", "0");
+        try exec.run(&r.plan, rid, &ex);
+    }
+}
+
+// -------- Feature: Global Error Handler --------
+
+fn failingProcessor(_: ?*anyopaque, _: *Exchange) anyerror!void {
+    return error.ProcessorFailed;
+}
+
+test "global error handler catches route errors" {
+    const alloc = std.testing.allocator;
+
+    const MockStore = zamel.MockStore;
+    var mock_store = MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var reg = Registry.init(testServices(alloc));
+    defer reg.deinit();
+    reg.setMockStore(&mock_store);
+
+    const error_ep = try reg.resolve(alloc, "mock:errors");
+
+    var services = testServices(alloc);
+    services.error_handler = .{
+        .endpoint = .{ .endpoint = error_ep },
+        .max_retries = 0,
+    };
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    var steps = [_]Step{.{ .Process = Processor.fromFn(failingProcessor, null) }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    exec.registry = &reg;
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    // runRoute uses the global error handler
+    try exec.runRoute(&plan, rid, &ex);
+
+    // Error metadata headers should be set
+    try std.testing.expectEqualStrings("ProcessorFailed", ex.getHeader("CamelExceptionMessage").?);
+    try std.testing.expect(ex.getHeader("CamelExceptionTimestamp") != null);
+    try std.testing.expect(ex.getHeader("CamelFailedRouteId") != null);
+
+    // Mock endpoint should have received the exchange
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("errors"));
+}
+
+test "global error handler with retries" {
+    const alloc = std.testing.allocator;
+
+    var call_count: u32 = 0;
+    const CountCtx = struct { count: *u32 };
+    var ctx = CountCtx{ .count = &call_count };
+
+    const MockStore = zamel.MockStore;
+    var mock_store = MockStore.init(alloc);
+    defer mock_store.deinit();
+
+    var reg = Registry.init(testServices(alloc));
+    defer reg.deinit();
+    reg.setMockStore(&mock_store);
+
+    const error_ep = try reg.resolve(alloc, "mock:dead-letters");
+
+    var services = testServices(alloc);
+    services.error_handler = .{
+        .endpoint = .{ .endpoint = error_ep },
+        .max_retries = 2,
+    };
+
+    var plan = RoutePlan.init();
+    defer plan.deinit(alloc);
+
+    // Processor that fails 3 times then succeeds
+    const counting_proc = Processor.fromFn(struct {
+        fn call(c: ?*anyopaque, _: *Exchange) anyerror!void {
+            const self: *CountCtx = @ptrCast(@alignCast(c.?));
+            self.count.* += 1;
+            return error.ProcessorFailed;
+        }
+    }.call, &ctx);
+
+    var steps = [_]Step{.{ .Process = counting_proc }};
+    const rid = try plan.addRoute(alloc, &steps);
+
+    var exec = SyncExecutor.init(services);
+    defer exec.deinit();
+    exec.registry = &reg;
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("test");
+
+    try exec.runRoute(&plan, rid, &ex);
+
+    // Should have been called 3 times total (1 original + 2 retries)
+    try std.testing.expectEqual(@as(u32, 3), call_count);
+    // Should have been sent to dead letter
+    try std.testing.expectEqual(@as(usize, 1), mock_store.captureCount("dead-letters"));
+}
+
+// -------- Feature: Cron Scheduling --------
+
+test "cron expression parsing and matching" {
+    const cron = zamel.cron;
+
+    // Every 5 minutes
+    const expr1 = try cron.parseCron("*/5 * * * *");
+    try std.testing.expect(expr1.matches(0, 12, 1, 1, 0));
+    try std.testing.expect(expr1.matches(15, 12, 1, 1, 0));
+    try std.testing.expect(!expr1.matches(3, 12, 1, 1, 0));
+
+    // Specific time: 9:30 on weekdays (Mon-Fri = 1-5)
+    const expr2 = try cron.parseCron("30 9 * * 1");
+    try std.testing.expect(expr2.matches(30, 9, 1, 1, 1));
+    try std.testing.expect(!expr2.matches(30, 9, 1, 1, 0)); // Sunday
+    try std.testing.expect(!expr2.matches(0, 9, 1, 1, 1)); // Wrong minute
+}

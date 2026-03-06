@@ -51,6 +51,10 @@ pub const SedaQueue = @import("seda.zig").SedaQueue;
 pub const AggregationStrategy = @import("aggregation.zig").AggregationStrategy;
 pub const aggregation = @import("aggregation.zig");
 
+pub const ErrorHandler = @import("services.zig").ErrorHandler;
+pub const CronExpr = @import("cron.zig").CronExpr;
+pub const cron = @import("cron.zig");
+
 pub const sync = @import("sync.zig");
 pub const Channel = @import("channel.zig").Channel;
 pub const ChannelMessage = @import("channel.zig").ChannelMessage;
@@ -70,4 +74,5 @@ test {
     _ = @import("builder_ct.zig");
     _ = @import("ct_predicates.zig");
     _ = @import("ct_processors.zig");
+    _ = @import("cron.zig");
 }

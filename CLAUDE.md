@@ -16,7 +16,7 @@ zig build run      # build and run the demo (src/main.zig)
 Requires Zig 0.16.0+. No external dependencies.
 
 ```bash
-zig build test     # run unit + integration tests (31 tests)
+zig build test     # run unit + integration tests (241 tests)
 ```
 
 ## Architecture
@@ -27,15 +27,15 @@ The core abstraction is a **message exchange** flowing through a **route** (a se
 
 - **Exchange** (`exchange.zig`) — The message unit: a body (`[]u8`) plus string headers (`StringHashMap`). All memory is owned and freed via its allocator.
 
-- **Step** (`step.zig`) — A tagged union representing one pipeline operation: `Process`, `Filter`, `To`, `Choice`, `Multicast`, `Split`, `Aggregate`, `Policy`. Choice/Multicast/Split contain nested `RouteId` references for sub-routes.
+- **Step** (`step.zig`) — A tagged union representing one pipeline operation: `Process`, `Filter`, `To`, `Choice`, `Multicast`, `Split`, `Aggregate`, `Policy`, `Batch`, `RequestReply`, `Resequencer`, and more. Choice/Multicast/Split/Batch/Resequencer contain nested `RouteId` references for sub-routes.
 
 - **RoutePlan** (`plan.zig`) — A flat list of `Route`s (each a `[]Step`), indexed by `RouteId` (u32). Sub-routes from Choice/Multicast are stored as separate entries in the same plan.
 
-- **RtBuilder** (`builder_rt.zig`) — Fluent runtime builder. Chains like `fromUri("timer:500") → choice() → when(...) → toUri("log:info") → endWhen() → end() → start()`. Uses an ArenaAllocator so the entire plan can be freed at once. Nested builders: `ChoiceBuilder`, `WhenBuilder`, `OtherwiseBuilder`, `PolicyBuilder`, `SplitBuilder`, `AggregateBuilder`.
+- **RtBuilder** (`builder_rt.zig`) — Fluent runtime builder. Chains like `fromUri("timer:500") → choice() → when(...) → toUri("log:info") → endWhen() → end() → start()`. Uses an ArenaAllocator so the entire plan can be freed at once. Nested builders: `ChoiceBuilder`, `WhenBuilder`, `OtherwiseBuilder`, `PolicyBuilder`, `SplitBuilder`, `AggregateBuilder`, `BatchBuilder`, `ResequencerBuilder`.
 
-- **SyncExecutor** (`executor_sync.zig`) — Walks a RoutePlan recursively and executes each Step. Handles Process, Filter, To, Choice, Multicast, Split, Aggregate, and Policy (Retry). Timeout/DeadLetter/CircuitBreaker policies return `error.NotImplemented`.
+- **SyncExecutor** (`executor_sync.zig`) — Walks a RoutePlan recursively and executes each Step. Handles all 26 step types including parallel multicast (thread-based), batch collection, request-reply with correlation IDs, and resequencing. `runRoute()` supports global error handlers.
 
-- **Registry** (`registry.zig`) — Resolves URI strings (scheme:rest) into Endpoints. Implements `log:{debug,info,warn,error}`, `timer:{ms}?repeat={n}`, and `file:{path}?append=true` schemes. Timer and file sources drive routes as Consumers.
+- **Registry** (`registry.zig`) — Resolves URI strings (scheme:rest) into Endpoints. Implements `log`, `timer`, `file`, `direct`, `seda`, `bean`, `mock`, `http`, `tcp`, `unix`, and `cron` schemes. Timer, file, and cron sources drive routes as Consumers.
 
 - **Services** (`services.zig`) — Dependency injection container holding the allocator, Clock, and optional Scheduler/StateStore.
 

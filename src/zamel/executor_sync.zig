@@ -18,10 +18,50 @@ const CircuitState = struct {
     half_open_successes: u32 = 0,
 };
 
+const BatchBuffer = struct {
+    bodies: std.ArrayList([]u8),
+
+    fn init() BatchBuffer {
+        return .{ .bodies = .empty };
+    }
+
+    fn deinit(self: *BatchBuffer, allocator: std.mem.Allocator) void {
+        for (self.bodies.items) |b| allocator.free(b);
+        self.bodies.deinit(allocator);
+    }
+};
+
+const ReseqEntry = struct {
+    seq: u64,
+    body: []u8,
+    headers: std.StringHashMap([]u8),
+};
+
+const ReseqBuffer = struct {
+    entries: std.ArrayList(ReseqEntry),
+
+    fn init() ReseqBuffer {
+        return .{ .entries = .empty };
+    }
+
+    fn deinit(self: *ReseqBuffer, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*e| {
+            allocator.free(e.body);
+            var it = e.headers.iterator();
+            while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+            e.headers.deinit();
+        }
+        self.entries.deinit(allocator);
+    }
+};
+
 pub const SyncExecutor = struct {
     services: Services,
     circuit_states: std.AutoHashMap(RouteId, CircuitState),
     lb_counters: std.AutoHashMap(usize, usize),
+    batch_buffers: std.AutoHashMap(RouteId, BatchBuffer),
+    reseq_buffers: std.AutoHashMap(RouteId, ReseqBuffer),
+    correlation_counter: u64 = 0,
     registry: ?*Registry = null,
 
     pub fn init(services: Services) SyncExecutor {
@@ -29,12 +69,51 @@ pub const SyncExecutor = struct {
             .services = services,
             .circuit_states = std.AutoHashMap(RouteId, CircuitState).init(services.allocator),
             .lb_counters = std.AutoHashMap(usize, usize).init(services.allocator),
+            .batch_buffers = std.AutoHashMap(RouteId, BatchBuffer).init(services.allocator),
+            .reseq_buffers = std.AutoHashMap(RouteId, ReseqBuffer).init(services.allocator),
         };
     }
 
     pub fn deinit(self: *SyncExecutor) void {
         self.circuit_states.deinit();
         self.lb_counters.deinit();
+        var bit = self.batch_buffers.iterator();
+        while (bit.next()) |e| e.value_ptr.deinit(self.services.allocator);
+        self.batch_buffers.deinit();
+        var rit = self.reseq_buffers.iterator();
+        while (rit.next()) |e| e.value_ptr.deinit(self.services.allocator);
+        self.reseq_buffers.deinit();
+    }
+
+    /// Run a route with global error handler support.
+    /// Use this as the top-level entry point; sub-routes use `run` directly.
+    pub fn runRoute(self: *SyncExecutor, plan: *const RoutePlan, route_id: RouteId, ex: *Exchange) !void {
+        if (self.run(plan, route_id, ex)) {} else |err| {
+            if (self.services.error_handler) |eh| {
+                // Retry if configured
+                var last_err: anyerror = err;
+                for (0..eh.max_retries) |_| {
+                    if (eh.retry_delay_ms > 0)
+                        @import("time_util.zig").sleepMs(@as(u64, eh.retry_delay_ms));
+                    if (self.run(plan, route_id, ex)) {
+                        return;
+                    } else |retry_err| {
+                        last_err = retry_err;
+                    }
+                }
+                // Send to error endpoint
+                try ex.putHeader("CamelExceptionMessage", @errorName(last_err));
+                var ts_buf: [32]u8 = undefined;
+                const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{self.services.clock.nowMillis()}) catch "0";
+                try ex.putHeader("CamelExceptionTimestamp", ts_str);
+                var rid_buf: [16]u8 = undefined;
+                const rid_str = std.fmt.bufPrint(&rid_buf, "{d}", .{route_id}) catch "?";
+                try ex.putHeader("CamelFailedRouteId", rid_str);
+                try self.sendTo(eh.endpoint, ex);
+            } else {
+                return err;
+            }
+        }
     }
 
     pub fn run(self: *SyncExecutor, plan: *const RoutePlan, route_id: RouteId, ex: *Exchange) !void {
@@ -67,8 +146,11 @@ pub const SyncExecutor = struct {
                 },
 
                 .Multicast => |m| {
-                    // Sync MVP: sequential execution
-                    for (m.routes) |rid| try self.run(plan, rid, ex);
+                    if (m.parallel and m.routes.len > 1) {
+                        try self.runParallelMulticast(plan, m.routes, ex);
+                    } else {
+                        for (m.routes) |rid| try self.run(plan, rid, ex);
+                    }
                 },
 
                 .Split => |s| {
@@ -507,6 +589,106 @@ pub const SyncExecutor = struct {
                         try self.sendTo(.{ .endpoint = ep }, ex);
                     }
                 },
+
+                .Batch => |b| {
+                    const gop = try self.batch_buffers.getOrPut(b.route);
+                    if (!gop.found_existing) gop.value_ptr.* = BatchBuffer.init();
+                    var buf = gop.value_ptr;
+
+                    try buf.bodies.append(ex.allocator, try ex.allocator.dupe(u8, ex.body));
+
+                    if (buf.bodies.items.len >= b.size) {
+                        // Join all buffered bodies into one exchange
+                        const joined = try std.mem.join(ex.allocator, b.separator, buf.bodies.items);
+                        defer ex.allocator.free(joined);
+
+                        // Clear buffer
+                        for (buf.bodies.items) |body| ex.allocator.free(body);
+                        buf.bodies.clearRetainingCapacity();
+
+                        // Create batch exchange and run sub-route
+                        var batch_ex = Exchange.init(ex.allocator);
+                        defer batch_ex.deinit();
+                        try batch_ex.setBody(joined);
+
+                        // Copy headers from current exchange
+                        var hit = ex.headers.iterator();
+                        while (hit.next()) |e| try batch_ex.putHeader(e.key_ptr.*, e.value_ptr.*);
+
+                        var size_buf: [16]u8 = undefined;
+                        const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{b.size}) catch "?";
+                        try batch_ex.putHeader("CamelBatchSize", size_str);
+
+                        try self.run(plan, b.route, &batch_ex);
+
+                        // Copy result back to original exchange
+                        try ex.setBody(batch_ex.body);
+                    }
+                },
+
+                .RequestReply => |rr| {
+                    // Generate correlation ID
+                    self.correlation_counter += 1;
+                    var id_buf: [32]u8 = undefined;
+                    const id_str = std.fmt.bufPrint(&id_buf, "corr-{d}-{d}", .{ self.services.clock.nowMillis(), self.correlation_counter }) catch "corr-?";
+                    try ex.putHeader(rr.correlation_header, id_str);
+
+                    // Send to endpoint (response modifies exchange body)
+                    try self.sendTo(rr.endpoint, ex);
+                },
+
+                .Resequencer => |r| {
+                    const gop = try self.reseq_buffers.getOrPut(r.route);
+                    if (!gop.found_existing) gop.value_ptr.* = ReseqBuffer.init();
+                    var buf = gop.value_ptr;
+
+                    // Parse sequence number from header
+                    const seq_str = ex.getHeader(r.header) orelse return error.ResequencerKeyMissing;
+                    const seq = std.fmt.parseUnsigned(u64, seq_str, 10) catch return error.InvalidSequenceNumber;
+
+                    // Copy headers for buffering
+                    var hdr_copy = std.StringHashMap([]u8).init(ex.allocator);
+                    var hit = ex.headers.iterator();
+                    while (hit.next()) |e| try hdr_copy.put(e.key_ptr.*, try ex.allocator.dupe(u8, e.value_ptr.*));
+
+                    try buf.entries.append(ex.allocator, .{
+                        .seq = seq,
+                        .body = try ex.allocator.dupe(u8, ex.body),
+                        .headers = hdr_copy,
+                    });
+
+                    if (buf.entries.items.len >= r.size) {
+                        // Sort by sequence number
+                        std.mem.sort(ReseqEntry, buf.entries.items, {}, struct {
+                            fn lessThan(_: void, a: ReseqEntry, b_entry: ReseqEntry) bool {
+                                return a.seq < b_entry.seq;
+                            }
+                        }.lessThan);
+
+                        // Process each entry in order
+                        for (buf.entries.items) |*entry| {
+                            var child = Exchange.init(ex.allocator);
+                            defer child.deinit();
+
+                            // Transfer body ownership to child
+                            child.body = entry.body;
+                            entry.body = &[_]u8{};
+
+                            // Transfer headers
+                            var hdr_it = entry.headers.iterator();
+                            while (hdr_it.next()) |e| {
+                                try child.headers.put(e.key_ptr.*, e.value_ptr.*);
+                            }
+                            // Clear so deinit doesn't double-free
+                            entry.headers.clearAndFree();
+
+                            try self.run(plan, r.route, &child);
+                        }
+
+                        // Clear buffer
+                        buf.entries.clearRetainingCapacity();
+                    }
+                },
             }
 
             // Message history tracking
@@ -593,7 +775,97 @@ pub const SyncExecutor = struct {
             .LoadBalancer => "LoadBalancer",
             .Transform => "Transform",
             .DynamicRouter => "DynamicRouter",
+            .Batch => "Batch",
+            .RequestReply => "RequestReply",
+            .Resequencer => "Resequencer",
         };
+    }
+
+    /// Flush any pending batch buffer for the given route.
+    pub fn flushBatch(self: *SyncExecutor, plan: *const RoutePlan, route_id: RouteId, separator: []const u8, sub_route: RouteId, ex: *Exchange) !void {
+        if (self.batch_buffers.getPtr(sub_route)) |buf| {
+            if (buf.bodies.items.len > 0) {
+                _ = route_id;
+                const joined = try std.mem.join(ex.allocator, separator, buf.bodies.items);
+                defer ex.allocator.free(joined);
+
+                for (buf.bodies.items) |body| ex.allocator.free(body);
+                buf.bodies.clearRetainingCapacity();
+
+                var batch_ex = Exchange.init(ex.allocator);
+                defer batch_ex.deinit();
+                try batch_ex.setBody(joined);
+
+                var size_buf: [16]u8 = undefined;
+                const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{buf.bodies.items.len}) catch "?";
+                try batch_ex.putHeader("CamelBatchSize", size_str);
+                try batch_ex.putHeader("CamelBatchComplete", "true");
+
+                try self.run(plan, sub_route, &batch_ex);
+                try ex.setBody(batch_ex.body);
+            }
+        }
+    }
+
+    fn runParallelMulticast(self: *SyncExecutor, plan: *const RoutePlan, routes: []const RouteId, ex: *Exchange) !void {
+        const ThreadCtx = struct {
+            executor: *SyncExecutor,
+            plan_ptr: *const RoutePlan,
+            route_id: RouteId,
+            ex_ptr: *Exchange,
+            result: anyerror!void = {},
+            done: sync.Event = .{},
+        };
+
+        // Clone exchange for each route (except last which uses original)
+        var clones = try self.services.allocator.alloc(Exchange, routes.len - 1);
+        defer {
+            for (clones) |*c| c.deinit();
+            self.services.allocator.free(clones);
+        }
+
+        for (0..routes.len - 1) |i| {
+            clones[i] = Exchange.init(ex.allocator);
+            try clones[i].setBody(ex.body);
+            var hit = ex.headers.iterator();
+            while (hit.next()) |e| try clones[i].putHeader(e.key_ptr.*, e.value_ptr.*);
+        }
+
+        var ctxs = try self.services.allocator.alloc(ThreadCtx, routes.len);
+        defer self.services.allocator.free(ctxs);
+
+        var threads = try self.services.allocator.alloc(std.Thread, routes.len);
+        defer self.services.allocator.free(threads);
+
+        var spawned: usize = 0;
+        errdefer {
+            for (0..spawned) |i| threads[i].join();
+        }
+
+        for (routes, 0..) |rid, i| {
+            const ex_ptr: *Exchange = if (i < routes.len - 1) &clones[i] else ex;
+            ctxs[i] = .{
+                .executor = self,
+                .plan_ptr = plan,
+                .route_id = rid,
+                .ex_ptr = ex_ptr,
+            };
+            threads[i] = try std.Thread.spawn(.{}, struct {
+                fn run(c: *ThreadCtx) void {
+                    c.result = c.executor.run(c.plan_ptr, c.route_id, c.ex_ptr);
+                    c.done.set();
+                }
+            }.run, .{&ctxs[i]});
+            spawned += 1;
+        }
+
+        // Join all threads
+        for (0..spawned) |i| threads[i].join();
+
+        // Check for errors (return first error found)
+        for (ctxs[0..spawned]) |ctx| {
+            try ctx.result;
+        }
     }
 
     fn sendTo(self: *SyncExecutor, eref: EndpointRef, ex: *Exchange) !void {
