@@ -30,7 +30,7 @@ pub const Exchange = struct {
         try self.headers.put(key, v);
     }
 
-    pub fn getHeader(self: *Exchange, key: []const u8) ?[]const u8 {
+    pub fn getHeader(self: *const Exchange, key: []const u8) ?[]const u8 {
         return self.headers.get(key);
     }
 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Exchange = @import("exchange.zig").Exchange;
 const Predicate = @import("predicate.zig").Predicate;
 const Processor = @import("processor.zig").Processor;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
@@ -140,6 +141,41 @@ pub const Step = union(enum) {
         header: []const u8 = "CamelSequenceNumber",
         route: RouteId,
     },
+
+    // Saga: long-running transaction with compensation steps on failure
+    Saga: struct {
+        steps: []const SagaStep,
+    },
+
+    // Content router: route by key extracted from exchange to named routes
+    ContentRouter: struct {
+        key_fn: KeyExtractor,
+        routes: []const ContentRoute,
+        default_route: ?RouteId = null,
+    },
+};
+
+pub const SagaStep = struct {
+    action: RouteId,
+    compensation: RouteId,
+};
+
+pub const KeyExtractor = struct {
+    extractFn: *const fn (ctx: ?*anyopaque, ex: *const Exchange) ?[]const u8,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: KeyExtractor, ex: *const Exchange) ?[]const u8 {
+        return self.extractFn(self.ctx, ex);
+    }
+
+    pub fn fromFn(f: *const fn (ctx: ?*anyopaque, ex: *const Exchange) ?[]const u8, ctx: ?*anyopaque) KeyExtractor {
+        return .{ .extractFn = f, .ctx = ctx };
+    }
+};
+
+pub const ContentRoute = struct {
+    key: []const u8,
+    route: RouteId,
 };
 
 pub const SplitKind = union(enum) {

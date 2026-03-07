@@ -18,6 +18,10 @@ const RecipientResolver = @import("recipient_resolver.zig").RecipientResolver;
 const Endpoint = @import("endpoint.zig").Endpoint;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 
+const SagaStep = @import("step.zig").SagaStep;
+const KeyExtractor = @import("step.zig").KeyExtractor;
+const ContentRoute = @import("step.zig").ContentRoute;
+
 const Registry = @import("registry.zig").Registry;
 const processors = @import("processors.zig");
 
@@ -372,6 +376,18 @@ pub const RtBuilder = struct {
 
     pub fn resequencerWithHeader(self: *RtBuilder, size: u32, header: []const u8) ResequencerBuilder {
         return ResequencerBuilder.init(self, size, header);
+    }
+
+    // ---- saga DSL ----
+
+    pub fn saga(self: *RtBuilder) SagaBuilder {
+        return SagaBuilder.init(self);
+    }
+
+    // ---- content router DSL ----
+
+    pub fn contentRouter(self: *RtBuilder, key_fn: KeyExtractor) ContentRouterBuilder {
+        return ContentRouterBuilder.init(self, key_fn);
     }
 
     // ---- load balancer DSL ----
@@ -1772,6 +1788,89 @@ pub const ResequencerBuilder = struct {
             .size = self.size,
             .header = self.header,
             .route = rid,
+        } });
+        return self.parent;
+    }
+};
+
+pub const SagaBuilder = struct {
+    parent: *RtBuilder,
+    saga_steps: std.ArrayList(SagaStep),
+
+    pub fn init(parent: *RtBuilder) SagaBuilder {
+        return .{
+            .parent = parent,
+            .saga_steps = .empty,
+        };
+    }
+
+    fn alloc(self: *SagaBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    /// Add a saga step with action and compensation sub-routes.
+    pub fn step(
+        self: *SagaBuilder,
+        action_steps: []const Step,
+        compensation_steps: []const Step,
+    ) !*SagaBuilder {
+        const a = self.alloc();
+        const action_rid = try self.parent.plan.addRoute(a, @constCast(action_steps));
+        const comp_rid = try self.parent.plan.addRoute(a, @constCast(compensation_steps));
+        try self.saga_steps.append(a, .{ .action = action_rid, .compensation = comp_rid });
+        return self;
+    }
+
+    pub fn endSaga(self: *SagaBuilder) !*RtBuilder {
+        try self.parent.cur_steps.append(self.alloc(), .{ .Saga = .{
+            .steps = self.saga_steps.items,
+        } });
+        return self.parent;
+    }
+};
+
+pub const ContentRouterBuilder = struct {
+    parent: *RtBuilder,
+    key_fn: KeyExtractor,
+    routes: std.ArrayList(ContentRoute),
+    default_steps: ?[]Step = null,
+
+    pub fn init(parent: *RtBuilder, key_fn: KeyExtractor) ContentRouterBuilder {
+        return .{
+            .parent = parent,
+            .key_fn = key_fn,
+            .routes = .empty,
+        };
+    }
+
+    fn alloc(self: *ContentRouterBuilder) std.mem.Allocator {
+        return self.parent.arena.allocator();
+    }
+
+    /// Map a key value to a set of steps.
+    pub fn when(self: *ContentRouterBuilder, key: []const u8, route_steps: []const Step) !*ContentRouterBuilder {
+        const a = self.alloc();
+        const rid = try self.parent.plan.addRoute(a, @constCast(route_steps));
+        try self.routes.append(a, .{ .key = key, .route = rid });
+        return self;
+    }
+
+    /// Set default steps when no key matches.
+    pub fn otherwise(self: *ContentRouterBuilder, route_steps: []const Step) !*ContentRouterBuilder {
+        self.default_steps = @constCast(route_steps);
+        return self;
+    }
+
+    pub fn endContentRouter(self: *ContentRouterBuilder) !*RtBuilder {
+        const a = self.alloc();
+        var default_rid: ?RouteId = null;
+        if (self.default_steps) |ds| {
+            default_rid = try self.parent.plan.addRoute(a, ds);
+        }
+        try self.parent.cur_steps.append(a, .{ .ContentRouter = .{
+            .key_fn = self.key_fn,
+            .routes = self.routes.items,
+            .default_route = default_rid,
         } });
         return self.parent;
     }

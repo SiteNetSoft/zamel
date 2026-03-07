@@ -55,6 +55,14 @@ pub const ErrorHandler = @import("services.zig").ErrorHandler;
 pub const CronExpr = @import("cron.zig").CronExpr;
 pub const cron = @import("cron.zig");
 
+pub const SagaStep = @import("step.zig").SagaStep;
+pub const KeyExtractor = @import("step.zig").KeyExtractor;
+pub const ContentRoute = @import("step.zig").ContentRoute;
+pub const jsonpath = @import("jsonpath.zig");
+pub const JsonPath = @import("jsonpath.zig").JsonPath;
+pub const websocket = @import("websocket.zig");
+pub const grpc = @import("grpc.zig");
+
 pub const sync = @import("sync.zig");
 pub const Channel = @import("channel.zig").Channel;
 pub const ChannelMessage = @import("channel.zig").ChannelMessage;
@@ -75,4 +83,7 @@ test {
     _ = @import("ct_predicates.zig");
     _ = @import("ct_processors.zig");
     _ = @import("cron.zig");
+    _ = @import("jsonpath.zig");
+    _ = @import("websocket.zig");
+    _ = @import("grpc.zig");
 }

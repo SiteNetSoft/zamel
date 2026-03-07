@@ -689,6 +689,59 @@ pub const SyncExecutor = struct {
                         buf.entries.clearRetainingCapacity();
                     }
                 },
+
+                .Saga => |saga| {
+                    // Execute actions in order; on failure, compensate in reverse
+                    var completed: usize = 0;
+                    var saga_err: ?anyerror = null;
+
+                    for (saga.steps) |saga_step| {
+                        if (self.run(plan, saga_step.action, ex)) {
+                            completed += 1;
+                        } else |err| {
+                            saga_err = err;
+                            try ex.putHeader("CamelSagaException", @errorName(err));
+                            break;
+                        }
+                    }
+
+                    if (saga_err != null) {
+                        // Run compensations in reverse order for completed steps
+                        var i = completed;
+                        while (i > 0) {
+                            i -= 1;
+                            // Compensation errors are logged but don't stop the rollback
+                            self.run(plan, saga.steps[i].compensation, ex) catch |comp_err| {
+                                try ex.putHeader("CamelSagaCompensationError", @errorName(comp_err));
+                            };
+                        }
+
+                        var idx_buf: [16]u8 = undefined;
+                        const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{completed}) catch "?";
+                        try ex.putHeader("CamelSagaCompensated", idx_str);
+
+                        return saga_err.?;
+                    }
+                },
+
+                .ContentRouter => |cr| {
+                    const key = cr.key_fn.call(ex) orelse {
+                        if (cr.default_route) |def| try self.run(plan, def, ex);
+                        continue;
+                    };
+
+                    var matched = false;
+                    for (cr.routes) |route_entry| {
+                        if (std.mem.eql(u8, route_entry.key, key)) {
+                            try self.run(plan, route_entry.route, ex);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        if (cr.default_route) |def| try self.run(plan, def, ex);
+                    }
+                },
             }
 
             // Message history tracking
@@ -778,6 +831,8 @@ pub const SyncExecutor = struct {
             .Batch => "Batch",
             .RequestReply => "RequestReply",
             .Resequencer => "Resequencer",
+            .Saga => "Saga",
+            .ContentRouter => "ContentRouter",
         };
     }
 

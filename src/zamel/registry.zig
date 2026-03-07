@@ -152,6 +152,10 @@ pub const Registry = struct {
             try @import("tcp.zig").makeTcpEndpoint(alloc, parsed.rest)
         else if (std.mem.eql(u8, parsed.scheme, "unix"))
             try @import("unix.zig").makeUnixEndpoint(alloc, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "ws"))
+            try @import("websocket.zig").makeWebSocketEndpoint(alloc, parsed.rest)
+        else if (std.mem.eql(u8, parsed.scheme, "grpc"))
+            try @import("grpc.zig").makeGrpcEndpoint(alloc, parsed.rest)
         else if (self.endpoint_factories.get(parsed.scheme)) |factory|
             try factory(alloc, parsed.rest)
         else

@@ -3514,3 +3514,303 @@ test "cron expression parsing and matching" {
     try std.testing.expect(!expr2.matches(30, 9, 1, 1, 0)); // Sunday
     try std.testing.expect(!expr2.matches(0, 9, 1, 1, 1)); // Wrong minute
 }
+
+// ======== Batch 2: Saga, Content Router, JsonPath, WebSocket, gRPC ========
+
+// -------- Feature: Saga Pattern --------
+
+test "saga: all actions succeed" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var sb = r.saga();
+    _ = try sb.step(
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("action1", "done");
+            }
+        }.f, null) }},
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("comp1", "done");
+            }
+        }.f, null) }},
+    );
+    _ = try sb.step(
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("action2", "done");
+            }
+        }.f, null) }},
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("comp2", "done");
+            }
+        }.f, null) }},
+    );
+    _ = try sb.endSaga();
+    const route_id = try r.build();
+
+    var executor = SyncExecutor.init(services);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("saga test");
+
+    try executor.run(&r.plan, route_id, &ex);
+
+    try std.testing.expectEqualStrings("done", ex.getHeader("action1").?);
+    try std.testing.expectEqualStrings("done", ex.getHeader("action2").?);
+    try std.testing.expect(ex.getHeader("comp1") == null);
+    try std.testing.expect(ex.getHeader("comp2") == null);
+}
+
+test "saga: second action fails, compensations run in reverse" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var sb = r.saga();
+    _ = try sb.step(
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("action1", "done");
+            }
+        }.f, null) }},
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("comp1", "done");
+            }
+        }.f, null) }},
+    );
+    _ = try sb.step(
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, _: *Exchange) !void {
+                return error.SagaActionFailed;
+            }
+        }.f, null) }},
+        &.{Step{ .Process = Processor.fromFn(struct {
+            fn f(_: ?*anyopaque, ex: *Exchange) !void {
+                try ex.putHeader("comp2", "done");
+            }
+        }.f, null) }},
+    );
+    _ = try sb.endSaga();
+    const route_id = try r.build();
+
+    var executor = SyncExecutor.init(services);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("saga fail test");
+
+    const result = executor.run(&r.plan, route_id, &ex);
+    try std.testing.expectError(error.SagaActionFailed, result);
+
+    try std.testing.expectEqualStrings("done", ex.getHeader("action1").?);
+    try std.testing.expectEqualStrings("done", ex.getHeader("comp1").?);
+    try std.testing.expect(ex.getHeader("comp2") == null);
+}
+
+// -------- Feature: Content Router --------
+
+test "content router: routes by header value" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    const KeyExtractor = @import("step.zig").KeyExtractor;
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    var cr = r.contentRouter(KeyExtractor.fromFn(struct {
+        fn extract(_: ?*anyopaque, ex: *const Exchange) ?[]const u8 {
+            return ex.getHeader("type");
+        }
+    }.extract, null));
+    _ = try cr.when("typeA", &.{Step{ .Process = Processor.fromFn(struct {
+        fn f(_: ?*anyopaque, ex: *Exchange) !void {
+            try ex.putHeader("routed", "A");
+        }
+    }.f, null) }});
+    _ = try cr.when("typeB", &.{Step{ .Process = Processor.fromFn(struct {
+        fn f(_: ?*anyopaque, ex: *Exchange) !void {
+            try ex.putHeader("routed", "B");
+        }
+    }.f, null) }});
+    _ = try cr.otherwise(&.{Step{ .Process = Processor.fromFn(struct {
+        fn f(_: ?*anyopaque, ex: *Exchange) !void {
+            try ex.putHeader("routed", "default");
+        }
+    }.f, null) }});
+    _ = try cr.endContentRouter();
+    const route_id = try r.build();
+
+    var executor = SyncExecutor.init(services);
+
+    // Test routing to B
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("test");
+        try ex.putHeader("type", "typeB");
+        try executor.run(&r.plan, route_id, &ex);
+        try std.testing.expectEqualStrings("B", ex.getHeader("routed").?);
+    }
+
+    // Test default route (unknown key)
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("test");
+        try ex.putHeader("type", "unknown");
+        try executor.run(&r.plan, route_id, &ex);
+        try std.testing.expectEqualStrings("default", ex.getHeader("routed").?);
+    }
+
+    // Test no key -> default
+    {
+        var ex = Exchange.init(alloc);
+        defer ex.deinit();
+        try ex.setBody("test");
+        try executor.run(&r.plan, route_id, &ex);
+        try std.testing.expectEqualStrings("default", ex.getHeader("routed").?);
+    }
+}
+
+// -------- Feature: JSON Path Transformation DSL --------
+
+test "jsonpath: extract nested value" {
+    const jp = zamel.jsonpath;
+    const json = "{\"user\":{\"name\":\"alice\",\"age\":30},\"active\":true}";
+
+    const path = try jp.parsePath("$.user.name");
+    const val = jp.extractString(json, path);
+    try std.testing.expect(val != null);
+    try std.testing.expectEqualStrings("alice", val.?);
+
+    const age_path = try jp.parsePath("$.user.age");
+    const age = jp.extract(json, age_path);
+    try std.testing.expect(age != null);
+    try std.testing.expectEqualStrings("30", age.?);
+}
+
+test "jsonpath: extract array element" {
+    const jp = zamel.jsonpath;
+    const json = "{\"items\":[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"}]}";
+
+    const path = try jp.parsePath("$.items[1].name");
+    const val = jp.extractString(json, path);
+    try std.testing.expect(val != null);
+    try std.testing.expectEqualStrings("b", val.?);
+}
+
+test "jsonpath: extractToBody in pipeline" {
+    const alloc = std.testing.allocator;
+    const jp = zamel.jsonpath;
+    const services = testServices(alloc);
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    const p = try jp.extractToBody(r.arena.allocator(), "$.name");
+    _ = try r.process(p);
+    const route_id = try r.build();
+
+    var executor = SyncExecutor.init(services);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("{\"name\":\"bob\",\"age\":25}");
+
+    try executor.run(&r.plan, route_id, &ex);
+    try std.testing.expectEqualStrings("bob", ex.body);
+}
+
+test "jsonpath: setJsonField in pipeline" {
+    const alloc = std.testing.allocator;
+    const jp = zamel.jsonpath;
+    const services = testServices(alloc);
+    var registry = Registry.init(services);
+    defer registry.deinit();
+
+    var r = RtBuilder.init(alloc, &registry);
+    defer r.deinit();
+
+    const p = try jp.setJsonField(r.arena.allocator(), "status", "myStatus");
+    _ = try r.process(p);
+    const route_id = try r.build();
+
+    var executor = SyncExecutor.init(services);
+
+    var ex = Exchange.init(alloc);
+    defer ex.deinit();
+    try ex.setBody("{\"name\":\"test\"}");
+    try ex.putHeader("myStatus", "active");
+
+    try executor.run(&r.plan, route_id, &ex);
+    try std.testing.expect(std.mem.indexOf(u8, ex.body, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ex.body, "\"name\":\"test\"") != null);
+}
+
+// -------- Feature: WebSocket Endpoint --------
+
+test "websocket: URL parsing" {
+    const ws = zamel.websocket;
+    const ep = try ws.makeWebSocketEndpoint(std.testing.allocator, "//127.0.0.1:8080/chat");
+    defer ep.deinit(std.testing.allocator);
+}
+
+test "websocket: registered in registry" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var reg = Registry.init(services);
+    defer reg.deinit();
+
+    const ep = try reg.resolve(alloc, "ws://127.0.0.1:9090/echo");
+    _ = ep;
+}
+
+// -------- Feature: gRPC Endpoint --------
+
+test "grpc: URL parsing" {
+    const g = zamel.grpc;
+    const ep = try g.makeGrpcEndpoint(std.testing.allocator, "//127.0.0.1:50051/mypackage.Svc/Method");
+    defer ep.deinit(std.testing.allocator);
+}
+
+test "grpc: encode/decode roundtrip" {
+    const g = zamel.grpc;
+    const alloc = std.testing.allocator;
+
+    const msg = "hello gRPC from integration test";
+    const encoded = try g.encodeGrpcMessage(msg, alloc);
+    defer alloc.free(encoded);
+
+    const decoded = g.decodeGrpcMessage(encoded);
+    try std.testing.expect(decoded != null);
+    try std.testing.expectEqualStrings(msg, decoded.?);
+}
+
+test "grpc: registered in registry" {
+    const alloc = std.testing.allocator;
+    const services = testServices(alloc);
+    var reg = Registry.init(services);
+    defer reg.deinit();
+
+    const ep = try reg.resolve(alloc, "grpc://127.0.0.1:50051/pkg.Svc/Method");
+    _ = ep;
+}

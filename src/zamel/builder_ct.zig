@@ -18,6 +18,10 @@ const RecipientResolver = @import("recipient_resolver.zig").RecipientResolver;
 const Endpoint = @import("endpoint.zig").Endpoint;
 const EndpointRef = @import("endpoint.zig").EndpointRef;
 
+const SagaStep = @import("step.zig").SagaStep;
+const KeyExtractor = @import("step.zig").KeyExtractor;
+const ContentRoute = @import("step.zig").ContentRoute;
+
 const Registry = @import("registry.zig").Registry;
 
 /// A compile-time branch for choiceOf: a predicate + the steps to run when matched.
@@ -309,6 +313,79 @@ pub fn CtBuilder(comptime num_steps: usize, comptime num_routes: usize) type {
                     return .{ .Resequencer = .{ .size = size, .header = header, .route = route_id } };
                 }
             }.make);
+        }
+
+        /// Saga with N steps, each having action + compensation sub-routes (2*N new routes).
+        pub fn sagaOf(
+            comptime self: Self,
+            comptime saga_steps: []const struct { action: []const Step, compensation: []const Step },
+        ) CtBuilder(num_steps + 1, num_routes + saga_steps.len * 2) {
+            const new_route_count = saga_steps.len * 2;
+            var new_routes: [num_routes + new_route_count][]const Step = undefined;
+            for (0..num_routes) |i| new_routes[i] = self.routes[i];
+
+            var saga_step_arr: [saga_steps.len]SagaStep = undefined;
+            for (saga_steps, 0..) |ss, i| {
+                const action_rid: RouteId = @intCast(num_routes + i * 2);
+                const comp_rid: RouteId = @intCast(num_routes + i * 2 + 1);
+                new_routes[num_routes + i * 2] = ss.action;
+                new_routes[num_routes + i * 2 + 1] = ss.compensation;
+                saga_step_arr[i] = .{ .action = action_rid, .compensation = comp_rid };
+            }
+
+            const step = Step{ .Saga = .{ .steps = &saga_step_arr } };
+
+            var new_steps: [num_steps + 1]Step = undefined;
+            for (0..num_steps) |i| new_steps[i] = self.steps[i];
+            new_steps[num_steps] = step;
+
+            return .{
+                .steps = new_steps,
+                .routes = new_routes,
+                .source_uri = self.source_uri,
+            };
+        }
+
+        /// Content router: route by key to named routes.
+        pub fn contentRouterOf(
+            comptime self: Self,
+            comptime key_fn: KeyExtractor,
+            comptime route_entries: []const struct { key: []const u8, steps: []const Step },
+            comptime default_steps: ?[]const Step,
+        ) CtBuilder(num_steps + 1, num_routes + route_entries.len + @as(usize, if (default_steps != null) 1 else 0)) {
+            const has_default: usize = if (default_steps != null) 1 else 0;
+            const new_route_count = route_entries.len + has_default;
+            var new_routes: [num_routes + new_route_count][]const Step = undefined;
+            for (0..num_routes) |i| new_routes[i] = self.routes[i];
+
+            var content_routes: [route_entries.len]ContentRoute = undefined;
+            for (route_entries, 0..) |entry, i| {
+                const rid: RouteId = @intCast(num_routes + i);
+                new_routes[num_routes + i] = entry.steps;
+                content_routes[i] = .{ .key = entry.key, .route = rid };
+            }
+
+            var default_rid: ?RouteId = null;
+            if (default_steps) |ds| {
+                default_rid = @intCast(num_routes + route_entries.len);
+                new_routes[num_routes + route_entries.len] = ds;
+            }
+
+            const step = Step{ .ContentRouter = .{
+                .key_fn = key_fn,
+                .routes = &content_routes,
+                .default_route = default_rid,
+            } };
+
+            var new_steps: [num_steps + 1]Step = undefined;
+            for (0..num_steps) |i| new_steps[i] = self.steps[i];
+            new_steps[num_steps] = step;
+
+            return .{
+                .steps = new_steps,
+                .routes = new_routes,
+                .source_uri = self.source_uri,
+            };
         }
 
         pub fn multicast(comptime self: Self, comptime branch_routes: []const []const Step) CtBuilder(num_steps + 1, num_routes + branch_routes.len) {
